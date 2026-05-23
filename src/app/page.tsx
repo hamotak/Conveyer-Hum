@@ -1,6 +1,7 @@
 "use client";
 import { useState, useMemo, useEffect } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { usePersistedState } from "./_use-persisted-state";
 
 // Rough estimate: TTS narration averages ~150 words per minute
@@ -284,6 +285,17 @@ export default function NewRunPage() {
           <div className="faint" style={{ fontSize: 12, marginTop: 5 }}>
             Picks the scene-split prompt, voice and motion for this channel. Manage in Channels &amp; Prompts.
           </div>
+          {presets.length === 0 && (
+            <div style={{ marginTop: 6 }}>
+              <Link
+                href="/prompts"
+                className="btn-ghost btn-sm"
+                style={{ color: "var(--accent)" }}
+              >
+                + Create your first channel profile
+              </Link>
+            </div>
+          )}
         </div>
 
         <div>
@@ -746,6 +758,40 @@ export default function NewRunPage() {
           Live logs for every stage stream into the run page in real time.
         </p>
       </div>
+
+      {script.trim() !== "" && (
+        <div
+          style={{
+            position: "fixed",
+            bottom: 16,
+            left: 260,
+            right: 16,
+            zIndex: 50,
+            background: "var(--surface-2)",
+            border: "1px solid var(--border)",
+            borderRadius: "var(--r)",
+            padding: "12px 56px 12px 20px",
+            boxShadow: "0 -4px 12px -4px rgba(0,0,0,0.25)",
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: 16,
+            flexWrap: "wrap",
+          }}
+        >
+          <div style={{ fontSize: 13, color: "var(--fg-muted)" }}>
+            <strong style={{ color: "var(--fg)" }}>{scriptStats.words}</strong> words · ≈{" "}
+            <strong style={{ color: "var(--accent-hover)" }}>{scriptStats.duration}</strong> final
+          </div>
+          <button className="btn" onClick={start} disabled={busy || !script.trim()}>
+            {busy
+              ? "Starting…"
+              : reuseCount > 0
+                ? `Run pipeline · reusing ${reuseCount} clip${reuseCount === 1 ? "" : "s"}`
+                : "Run pipeline"}
+          </button>
+        </div>
+      )}
     </div>
   );
 }
