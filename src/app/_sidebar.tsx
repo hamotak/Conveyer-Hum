@@ -1,7 +1,7 @@
 "use client";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { ThemeToggle } from "./_theme-toggle";
 
 interface NavItem {
@@ -126,22 +126,62 @@ const NAV: NavGroup[] = [
 
 export function Sidebar() {
   const pathname = usePathname();
+  const [open, setOpen] = useState(false);
+
+  // Close the drawer on navigation.
+  useEffect(() => {
+    setOpen(false);
+  }, [pathname]);
+
+  // ESC closes the drawer while it's open.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
 
   return (
-    <aside
-      style={{
-        width: 244,
-        flexShrink: 0,
-        height: "100vh",
-        position: "sticky",
-        top: 0,
-        background: "var(--bg-deep)",
-        borderRight: "1px solid var(--border)",
-        display: "flex",
-        flexDirection: "column",
-        padding: "20px 14px",
-      }}
-    >
+    <>
+      {/* Mobile top bar with the hamburger — only shown ≤768px (CSS). */}
+      <div className="mobile-topbar">
+        <button
+          aria-label="Open menu"
+          className="btn-ghost btn-sm"
+          onClick={() => setOpen(true)}
+          style={{ display: "flex", alignItems: "center", padding: 8 }}
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
+            <path d="M3 6h18M3 12h18M3 18h18" />
+          </svg>
+        </button>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div
+            style={{
+              width: 24,
+              height: 24,
+              borderRadius: 6,
+              background: "linear-gradient(135deg, var(--accent), #ff8a72)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontWeight: 800,
+              fontSize: 13,
+              color: "#fff",
+            }}
+          >
+            C
+          </div>
+          <div style={{ fontWeight: 700, fontSize: 14 }}>Conveyer Hum</div>
+        </div>
+      </div>
+
+      {/* Drawer backdrop (mobile, when open). */}
+      {open && <div className="app-backdrop" onClick={() => setOpen(false)} />}
+
+      <aside className={`app-sidebar${open ? " open" : ""}`}>
       {/* Logo */}
       <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "4px 8px 22px" }}>
         <div
@@ -168,6 +208,17 @@ export function Sidebar() {
           </div>
           <div style={{ fontSize: 11, color: "var(--fg-faint)" }}>AI video toolkit</div>
         </div>
+        {/* Close button — mobile drawer only (CSS-gated). */}
+        <button
+          aria-label="Close menu"
+          className="sidebar-close btn-ghost btn-sm"
+          onClick={() => setOpen(false)}
+          style={{ marginLeft: "auto", padding: 6 }}
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
+            <path d="M18 6 6 18M6 6l12 12" />
+          </svg>
+        </button>
       </div>
 
       {/* Nav groups */}
@@ -196,6 +247,7 @@ export function Sidebar() {
                 <Link
                   key={item.href}
                   href={item.href}
+                  onClick={() => setOpen(false)}
                   style={{
                     display: "flex",
                     alignItems: "center",

@@ -68,7 +68,9 @@ body {
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  letter-spacing: -0.011em;
+  /* Global tracking left at the browser default — the prior -0.011em squeezed
+     all body text and read poorly on small screens. */
+  letter-spacing: normal;
 }
 
 ::selection {
@@ -379,4 +381,136 @@ html[data-theme="light"] ::-webkit-scrollbar-thumb {
 }
 html[data-theme="light"] ::-webkit-scrollbar-thumb:hover {
   background: #b4b4bc;
+}
+
+/* ── App shell + responsive layout ─────────────────────────────────────────
+   Desktop: a sticky 244px sidebar beside centered content.
+   Mobile (≤768px): the sidebar becomes an off-canvas drawer behind a fixed top
+   bar, content goes full-width, and the Run bar spans edge-to-edge. */
+.app-shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+.app-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  justify-content: center;
+}
+.app-content {
+  width: 100%;
+  max-width: 1080px;
+  padding: 32px 36px 80px;
+}
+
+/* Sidebar — desktop sticky rail. */
+.app-sidebar {
+  width: 244px;
+  flex-shrink: 0;
+  height: 100vh;
+  position: sticky;
+  top: 0;
+  background: var(--bg-deep);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 20px 14px;
+}
+
+/* Mobile-only chrome — hidden on desktop. */
+.mobile-topbar {
+  display: none;
+}
+.app-backdrop {
+  display: none;
+}
+.sidebar-close {
+  display: none;
+}
+
+/* The sticky bottom Run bar on the New Run page. Offset by the sidebar width on
+   desktop; full-width on mobile. */
+.run-bar {
+  position: fixed;
+  bottom: 16px;
+  left: 244px;
+  right: 16px;
+  z-index: 50;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: 12px 20px;
+  box-shadow: 0 -4px 12px -4px rgba(0, 0, 0, 0.25);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 768px) {
+  /* Fixed top bar with the hamburger. */
+  .mobile-topbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 52px;
+    padding: 0 12px;
+    background: var(--bg-deep);
+    border-bottom: 1px solid var(--border);
+    z-index: 60;
+  }
+
+  /* Sidebar slides in from the left as a drawer. */
+  .app-sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    z-index: 70;
+    transform: translateX(-100%);
+    transition: transform 0.22s ease;
+    box-shadow: var(--shadow-lg);
+  }
+  .app-sidebar.open {
+    transform: translateX(0);
+  }
+  .sidebar-close {
+    display: block;
+  }
+
+  .app-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 65;
+    animation: appFadeIn 0.15s ease;
+  }
+
+  /* Content clears the 52px top bar and uses the full mobile width. */
+  .app-content {
+    padding: 64px 16px 96px;
+  }
+
+  /* Run bar spans the screen — no 244px left offset over the (hidden) rail. */
+  .run-bar {
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+  }
+}
+
+@keyframes appFadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }

@@ -760,25 +760,7 @@ export default function NewRunPage() {
       </div>
 
       {script.trim() !== "" && (
-        <div
-          style={{
-            position: "fixed",
-            bottom: 16,
-            left: 260,
-            right: 16,
-            zIndex: 50,
-            background: "var(--surface-2)",
-            border: "1px solid var(--border)",
-            borderRadius: "var(--r)",
-            padding: "12px 56px 12px 20px",
-            boxShadow: "0 -4px 12px -4px rgba(0,0,0,0.25)",
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            gap: 16,
-            flexWrap: "wrap",
-          }}
-        >
+        <div className="run-bar">
           <div style={{ fontSize: 13, color: "var(--fg-muted)" }}>
             <strong style={{ color: "var(--fg)" }}>{scriptStats.words}</strong> words · ≈{" "}
             <strong style={{ color: "var(--accent-hover)" }}>{scriptStats.duration}</strong> final

@@ -17,12 +17,10 @@ export default function RootLayout({ children }: { children: ReactNode }) {
     <html lang="en">
       <body>
         <script dangerouslySetInnerHTML={{ __html: themeScript }} />
-        <div style={{ display: "flex", minHeight: "100vh" }}>
+        <div className="app-shell">
           <Sidebar />
-          <main style={{ flex: 1, minWidth: 0, display: "flex", justifyContent: "center" }}>
-            <div style={{ width: "100%", maxWidth: 1080, padding: "32px 36px 80px" }}>
-              {children}
-            </div>
+          <main className="app-main">
+            <div className="app-content">{children}</div>
           </main>
         </div>
       </body>
