@@ -10,16 +10,15 @@ import {
   uploadFile,
   uploadString,
 } from "./gdrive";
-import type { Scene } from "./scene-split";
-import type { TtsResult } from "./tts";
+import {
+  countRawClipsOnDisk,
+  shouldCleanupRawClips,
+} from "./scene-assets-disk";
+import type { SceneAsset } from "./scene-assets-disk";
 
-/** Shape of a scene asset coming out of the pipeline. Mirrors AssembleInput. */
-export interface SceneAsset {
-  scene: Scene;
-  imagePath: string;
-  videoPath?: string | null;
-  audio: TtsResult;
-}
+// Re-export so existing importers (the drive route) keep their import path.
+export { rebuildSceneAssetsFromDisk } from "./scene-assets-disk";
+export type { SceneAsset };
 
 interface ClipsManifestEntry {
   index: number;
@@ -162,6 +161,27 @@ export async function syncRunToDrive(
     }
   }
 
+  // Guard: a run with a saved scene plan should always produce clips. If we'd
+  // upload an EMPTY clips.json for such a run, refuse — overwriting Drive's
+  // manifest with zero clips wipes the run from the Clip Library. Two ways this
+  // happens, both handled here:
+  //   • raw clips are still on disk but none reconstructed  → reconstruction bug
+  //     (the original continuous-voiceover bug: per-scene audio was required).
+  //   • no raw clips remain                                 → they were already
+  //     uploaded + cleaned by an earlier sync; the Drive clips.json is good and
+  //     a re-sync must not clobber it.
+  // Either way we abort before touching Drive, leaving local files intact.
+  if (uploadedClips.length === 0 && fs.existsSync(path.join(runDir, "scenes.json"))) {
+    const rawClipCount = countRawClipsOnDisk(runDir);
+    const detail =
+      rawClipCount > 0
+        ? `${rawClipCount} raw clip(s) are on disk but none were reconstructed into uploadable assets — asset reconstruction failed.`
+        : `no raw clips remain on disk — they were likely already uploaded and cleaned up by an earlier sync, so the existing Drive clips.json is left intact.`;
+    throw new Error(
+      `Refusing to sync an empty clips.json for a run with a saved scene plan. ${detail} Local files were left untouched.`
+    );
+  }
+
   // 2. Build + upload manifest files. These are what the future AI search reads.
   const manifest: ClipsManifest = {
     schema_version: 1,
@@ -202,59 +222,24 @@ export async function syncRunToDrive(
   updateDriveRefs.run(runFolderId, finalVideoId, runId);
 
   // 4. Clean up local raw clips — they live in Drive now. Final video and
-  //    audio files stay locally.
-  cleanupLocalRawClips(runId, runDir);
+  //    audio files stay locally. Only delete when EVERY asset we set out to
+  //    upload actually reached Drive; a partial/empty upload keeps its raw clips
+  //    locally so a re-sync can retry without regenerating.
+  if (shouldCleanupRawClips(uploadedClips.length, sceneAssets.length)) {
+    cleanupLocalRawClips(runId, runDir);
+  } else {
+    log(
+      runId,
+      "warn",
+      `Kept local raw clips — uploaded ${uploadedClips.length}/${sceneAssets.length} clips (partial). Re-sync to retry.`,
+      { stage: "gdrive" }
+    );
+  }
 
   log(runId, "success", `Drive sync complete · ${uploadedClips.length} clips + final video`, {
     stage: "gdrive",
   });
   return true;
-}
-
-/**
- * Reconstruct SceneAsset[] from files left on disk. Used by re-sync to upload
- * a run that has finished but never made it to Drive (or got partially uploaded
- * and we want to retry).
- *
- * Reads scenes.json (always written by the pipeline) and pairs each scene with
- * its raw video clip + audio file by filename convention.
- */
-export function rebuildSceneAssetsFromDisk(runDir: string): SceneAsset[] {
-  const scenesPath = path.join(runDir, "scenes.json");
-  if (!fs.existsSync(scenesPath)) return [];
-  const scenes = JSON.parse(fs.readFileSync(scenesPath, "utf-8")) as Scene[];
-
-  const animDir = path.join(runDir, "animations");
-  const audioDir = path.join(runDir, "audio");
-
-  const result: SceneAsset[] = [];
-  for (const scene of scenes) {
-    const padded = String(scene.index).padStart(3, "0");
-    // Match common filename patterns from the pipeline: scene_001.mp4, scene-001.mp4.
-    const videoCandidates = [
-      path.join(animDir, `scene_${padded}.mp4`),
-      path.join(animDir, `scene-${padded}.mp4`),
-      path.join(animDir, `${padded}.mp4`),
-    ];
-    const audioCandidates = [
-      path.join(audioDir, `scene_${padded}.mp3`),
-      path.join(audioDir, `scene-${padded}.mp3`),
-      path.join(audioDir, `${padded}.mp3`),
-    ];
-    const videoPath = videoCandidates.find((p) => fs.existsSync(p)) ?? null;
-    const audioPath = audioCandidates.find((p) => fs.existsSync(p));
-    if (!audioPath) continue; // no audio = can't reconstruct
-    // We don't know exact audio duration without ffprobe; pipeline normally
-    // measures it. For re-sync this only affects manifest metadata, so we
-    // record 0 and the user can re-run the original pipeline for exact values.
-    result.push({
-      scene,
-      imagePath: videoPath ?? audioPath,
-      videoPath,
-      audio: { filePath: audioPath, durationSec: 0 },
-    });
-  }
-  return result;
 }
 
 /**

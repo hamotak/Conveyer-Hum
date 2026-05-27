@@ -6,6 +6,7 @@ import { ensureInit } from "@/lib/init";
 import { log } from "@/lib/logger";
 import { getRunDir } from "@/lib/run-paths";
 import { getConnectionStatus } from "@/lib/services/gdrive";
+import { countRawClipsOnDisk } from "@/lib/services/scene-assets-disk";
 import { rebuildSceneAssetsFromDisk, syncRunToDrive } from "@/lib/services/run-upload";
 
 interface DriveStatus {
@@ -57,10 +58,9 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
 
   const gdrive = await getConnectionStatus();
   const runDir = getRunDir(id);
-  const animDir = path.join(runDir, "animations");
-  const rawClipsRemainCount = fs.existsSync(animDir)
-    ? fs.readdirSync(animDir).filter((f) => f.endsWith(".mp4")).length
-    : 0;
+  // Count real scene clips only (excludes synthetic buffer clips) so the retry
+  // hint isn't fooled by a leftover buffer_kenburns.mp4.
+  const rawClipsRemainCount = countRawClipsOnDisk(runDir);
 
   const status: DriveStatus = {
     syncEnabled: gdrive.syncEnabled,
