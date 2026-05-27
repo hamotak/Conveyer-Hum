@@ -3,32 +3,40 @@ import type { OAuth2Client } from "google-auth-library";
 import fs from "node:fs";
 import path from "node:path";
 import { getSetting, setSetting } from "../settings";
+import { GDRIVE_CALLBACK_PATH, oauthRedirectUri } from "./gdrive-redirect";
 
 const SCOPES = [
   "https://www.googleapis.com/auth/drive.file",       // only files we create/open
   "https://www.googleapis.com/auth/userinfo.email",   // to identify connected account
 ];
 
-// MUST match the URI added in Google Cloud Console > OAuth client > Authorized redirect URIs.
-// We hard-code port 3000 because Next.js may pick 3001 if 3000 is busy, but the OAuth
-// flow has to run on a stable port the user registered in their Google Cloud project.
-export const GDRIVE_REDIRECT_URI = "http://localhost:3000/api/gdrive/oauth/callback";
+// Fallback only — used by refresh-token API calls, where redirect_uri is never
+// sent to Google. The interactive OAuth dance ALWAYS passes an explicit URI
+// derived from the live request (see oauthRedirectUri), so the redirect matches
+// the port Next.js actually bound (which may be 3001/3002 if 3000 was busy).
+const DEFAULT_REDIRECT_URI = `http://localhost:3000${GDRIVE_CALLBACK_PATH}`;
+
+// Re-export so route handlers keep importing the redirect helper from here.
+export { oauthRedirectUri, GDRIVE_CALLBACK_PATH };
 
 /** Build a fresh OAuth2 client, optionally with refresh_token loaded. */
-export function getOAuth2Client(): OAuth2Client | null {
+export function getOAuth2Client(redirectUri: string = DEFAULT_REDIRECT_URI): OAuth2Client | null {
   const clientId = getSetting("GDRIVE_CLIENT_ID");
   const clientSecret = getSetting("GDRIVE_CLIENT_SECRET");
   if (!clientId || !clientSecret) return null;
 
-  const client = new google.auth.OAuth2(clientId, clientSecret, GDRIVE_REDIRECT_URI);
+  const client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
   const refresh = getSetting("GDRIVE_REFRESH_TOKEN");
   if (refresh) client.setCredentials({ refresh_token: refresh });
   return client;
 }
 
-/** First leg of OAuth: URL the user gets redirected to. */
-export function buildAuthUrl(): string {
-  const oauth = getOAuth2Client();
+/**
+ * First leg of OAuth: URL the user gets redirected to. `redirectUri` MUST be the
+ * same value passed to exchangeCodeForTokens — Google rejects a mismatch.
+ */
+export function buildAuthUrl(redirectUri: string): string {
+  const oauth = getOAuth2Client(redirectUri);
   if (!oauth) {
     throw new Error("Set GDRIVE_CLIENT_ID and GDRIVE_CLIENT_SECRET in /settings first");
   }
@@ -39,9 +47,12 @@ export function buildAuthUrl(): string {
   });
 }
 
-/** Second leg of OAuth: trade code for tokens, store refresh_token + email. */
-export async function exchangeCodeForTokens(code: string): Promise<{ email: string }> {
-  const oauth = getOAuth2Client();
+/**
+ * Second leg of OAuth: trade code for tokens, store refresh_token + email.
+ * `redirectUri` must match the one used in buildAuthUrl for the same flow.
+ */
+export async function exchangeCodeForTokens(code: string, redirectUri: string): Promise<{ email: string }> {
+  const oauth = getOAuth2Client(redirectUri);
   if (!oauth) throw new Error("OAuth client not configured");
 
   const { tokens } = await oauth.getToken(code);

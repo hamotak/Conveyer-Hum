@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { ensureInit } from "@/lib/init";
-import { exchangeCodeForTokens } from "@/lib/services/gdrive";
+import { exchangeCodeForTokens, oauthRedirectUri } from "@/lib/services/gdrive";
 
 /**
  * Second leg of OAuth: Google redirects the user here with `?code=...` after
@@ -24,7 +24,8 @@ export async function GET(req: Request) {
   }
 
   try {
-    await exchangeCodeForTokens(code);
+    // Must reuse the SAME redirect_uri the start leg sent, or Google rejects it.
+    await exchangeCodeForTokens(code, oauthRedirectUri(req));
     return NextResponse.redirect(`${origin}/settings?gdrive=connected`);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
