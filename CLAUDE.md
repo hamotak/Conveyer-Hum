@@ -9,16 +9,17 @@ of Conveyer Hum so you can confidently answer questions and make changes.
 
 A **local web app** for making faceless-YouTube content. It runs entirely on the
 user's machine (Next.js dev server + local SQLite + local FFmpeg) — no hosted
-backend. It has **three modes**, picked from the sidebar:
+backend. It has **two modes**, picked from the sidebar:
 
 1. **Video Conveyer** (`/`) — the full pipeline: paste a script → split into
-   scenes → MiniMax voiceover + Grok video per scene → assemble one MP4.
-2. **Voiceover** (`/voiceover`) — a standalone MiniMax TTS tool: text → MP3,
-   no script splitting or video.
-3. **Re-assembly** (`/reassembly`) — hybrid build: AI matches script scenes to
+   scenes → ElevenLabs voiceover + Veo video per scene → assemble one MP4.
+2. **Re-assembly** (`/reassembly`) — hybrid build: AI matches script scenes to
    clips in the Google Drive library, the user swaps any pick, and only the
    missing scenes are generated fresh. It reuses the Video Conveyer pipeline
    via a manual reuse map.
+
+(A standalone **Voiceover** mode existed previously but has been removed —
+`src/app/voiceover/` and `/api/voiceover/*` are gone.)
 
 **Target users**: non-technical YouTube channel operators. UX must stay simple.
 **Primary operator**: Vlad (mentor) builds/extends it; his mentees (e.g. Miguel
@@ -31,8 +32,10 @@ of Bull Network) use it and request features.
 - Forked from **Conveyer Grok** (lineage: Conveyer Isabell → Hum Conveyer →
   Conveyer Grok → Conveyer Hum). Conveyer Grok stays untouched as the base.
 - Conveyer Grok used **xAI Grok** for video (via 69labs) and **HeyGen** for TTS.
-- Conveyer Hum keeps Grok for video and swaps the voiceover to **MiniMax**, also
-  routed through 69labs — so a single `LABS69_API_KEY` covers video + audio.
+- Conveyer Hum now defaults to **Veo 3.1 Fast** for video and **ElevenLabs** for
+  voiceover, both routed through 69labs — so a single `LABS69_API_KEY` covers
+  video + audio. **Grok** (fixed ~6s clips) and **MiniMax** TTS remain available
+  as legacy/alternative options, but neither is the default any more.
 - Because of the fork lineage, some legacy names survive intentionally:
   - The DB column `prompt_presets.content` actually holds the scene_split prompt.
   - The setting key `ANIMATION_KEEP_VEO_AUDIO` applies to any model, not just Veo.
@@ -49,14 +52,14 @@ of Bull Network) use it and request features.
 - **fluent-ffmpeg** — video assembly (needs system FFmpeg)
 - **@anthropic-ai/sdk** — optional Claude scene-split path
 - **googleapis** — Google Drive sync
-- Node ≥ 20. Dev server: `npm run dev` on port 3000.
+- Node ≥ 20. Dev server: `npm run dev` — uses port 3000 if free, otherwise the
+  next free port (3001, 3002, …).
 
 ---
 
 ## Pipeline — end to end
 
-This is the engine behind **Video Conveyer** and **Re-assembly**. The Voiceover
-mode is fully independent and never touches it (see "Core concepts" below).
+This is the engine behind both modes — **Video Conveyer** and **Re-assembly**.
 
 Entry point: `POST /api/runs` → inserts a `runs` row → calls `runPipeline()` in
 the background → redirects the UI to `/runs/[id]` which streams logs.
@@ -69,10 +72,12 @@ the background → redirects the UI to `/runs/[id]` which streams logs.
    chosen channel profile's `scene_split`, else the global default.
 2. **Per scene, in parallel** (concurrency-limited via `plimit.ts`):
    - `synthesizeScene()` (`services/tts.ts`) → narration MP3. Default provider
-     MiniMax via 69labs (`minimaxTts`); 69labs Edge/Eleven, ElevenLabs and
-     OpenAI stay available as alternatives via `TTS_PROVIDER`.
-   - `animateScene()` (`services/img2vid.ts`) → ~6s silent video clip via Grok
-     through 69labs. OR, if the scene was marked for reuse, `downloadReusedClip()`
+     is 69labs with `TTS_VOICE_PROVIDER="elevenlabs"`; MiniMax via 69labs,
+     ElevenLabs (direct) and OpenAI stay available as alternatives via
+     `TTS_PROVIDER` / `TTS_VOICE_PROVIDER`.
+   - `animateScene()` (`services/img2vid.ts`) → silent video clip via Veo 3.1
+     Fast through 69labs (default). Grok (legacy, fixed ~6s clip) and Kling stay
+     available. OR, if the scene was marked for reuse, `downloadReusedClip()`
      pulls an existing clip from Google Drive instead.
 3. **Per-scene render** — `services/video-assemble.ts` combines narration + clip
    into one MP4 per scene, matching durations (trim / stretch / pad).
@@ -90,18 +95,23 @@ Server-Sent Events (`/api/runs/[id]/logs`).
 | Service | Used for | Notes |
 |---|---|---|
 | **Google Gemini** | scene split | `GOOGLE_API_KEY`. Free tier fine. |
-| **69labs.vip** | Grok video + MiniMax voiceover | `LABS69_API_KEY` (covers both). Multi-key supported (newline/comma separated). Each key = 5 parallel video jobs. |
-| **MiniMax (via 69labs)** | TTS voiceover | `TTS_VOICE_ID` = catalog voice id e.g. `English_Comedian` (or a cloned voice). Model `speech-02-hd`. |
-| **Google Drive** | optional sync + reuse | OAuth2, callback `localhost:3000/api/gdrive/oauth/callback`. |
+| **69labs.vip** | Veo video (default; Grok legacy) + ElevenLabs voiceover (default; MiniMax alt) | `LABS69_API_KEY` (covers both). Multi-key supported (newline/comma separated). Each key = 5 parallel video jobs. |
+| **ElevenLabs (via 69labs)** | TTS voiceover (default) | Default `TTS_PROVIDER="69labs"` + `TTS_VOICE_PROVIDER="elevenlabs"`. `TTS_VOICE_ID` = the voice id for the chosen provider. |
+| **MiniMax (via 69labs)** | TTS voiceover (alternative) | Set `TTS_VOICE_PROVIDER="minimax"`. MiniMax voice id is a catalog string e.g. `English_Comedian` (or a cloned voice). Model `speech-02-hd`. |
+| **Google Drive** | optional sync + reuse | OAuth2. The callback `redirect_uri` is derived from the live request origin (overridable via `APP_ORIGIN` / `NEXT_PUBLIC_APP_ORIGIN`), e.g. `http://localhost:3001/api/gdrive/oauth/callback` if Next picked port 3001 — NOT hardcoded to 3000. The Settings page shows the exact callback URL to register in Google Cloud. |
 
 ### Hard external constraints (don't fight these)
 
 - **Grok via 69labs returns a fixed ~6s clip.** 69labs runtime-blocks the
   `duration` parameter for Grok — sending it (any format) returns HTTP 400.
-  So scene-split prompts MUST keep each scene ≤ ~6s of narration.
-- **MiniMax voice ids are catalog strings, not UUIDs.** A MiniMax voice id looks
-  like `English_Comedian` (browse the catalog in the 69labs dashboard → MiniMax)
-  or is a cloned-voice id. `tts.ts` sends it with `voiceProvider: "minimax"`.
+  Grok is now the legacy video option; the default is Veo 3.1 Fast, which is not
+  capped at 6s. If a channel still uses Grok, its scene-split prompt MUST keep
+  each scene ≤ ~6s of narration.
+- **MiniMax voice ids are catalog strings, not UUIDs.** When using the MiniMax
+  TTS alternative, the voice id looks like `English_Comedian` (browse the catalog
+  in the 69labs dashboard → MiniMax) or is a cloned-voice id. `tts.ts` sends it
+  with `voiceProvider: "minimax"`. The default ElevenLabs-via-69labs provider
+  uses ElevenLabs voice ids instead.
 - **Windows Defender** truncates native `.node` binaries on `npm install`.
   `scripts/fix-native-binaries.mjs` (postinstall) restores them from a sibling
   project on Windows; it no-ops on macOS/Linux.
@@ -117,8 +127,7 @@ src/
 │   ├── _sidebar.tsx            Client sidebar, active-route highlighting
 │   ├── globals.css             Premium design system (tokens + component classes)
 │   ├── page.tsx                Video Conveyer — new-run page (Mode 1)
-│   ├── voiceover/page.tsx      Voiceover — standalone MiniMax TTS (Mode 2)
-│   ├── reassembly/page.tsx     Re-assembly — hybrid library build (Mode 3)
+│   ├── reassembly/page.tsx     Re-assembly — hybrid library build (Mode 2)
 │   ├── runs/page.tsx           Run history list
 │   ├── runs/[id]/page.tsx      Run detail — logs (SSE), final video, assets
 │   ├── library/page.tsx        Drive library browser
@@ -126,7 +135,7 @@ src/
 │   ├── settings/page.tsx       Keys & Settings (required keys + Drive)
 │   ├── settings/_groups.ts     Settings form schema (single source of truth)
 │   ├── settings/_group-card.tsx  Renders one settings group
-│   ├── advanced/page.tsx       Advanced settings
+│   ├── advanced/page.tsx       Redirects to /settings?tab=pipeline (advanced settings merged into /settings)
 │   └── api/
 │       ├── runs/route.ts             POST create run, GET list
 │       ├── runs/[id]/route.ts        GET one run
@@ -137,15 +146,12 @@ src/
 │       ├── runs/[id]/file/route.ts   GET serve a run file
 │       ├── runs/[id]/open-folder/route.ts  POST open run folder in OS
 │       ├── runs/[id]/reassemble/route.ts   DISABLED (returns 410)
-│       ├── prompts/route.ts          GET/POST default prompts
+│       ├── prompts/route.ts          GET/POST default prompts (latent — no current UI caller)
 │       ├── prompt-presets/route.ts   GET list / POST create channel profile
 │       ├── prompt-presets/[id]/route.ts  GET/PUT/DELETE channel profile
 │       ├── preview/scenes/route.ts   POST scene-split preview (no run created)
 │       ├── library/runs/route.ts     GET Drive library listing
 │       ├── library/find-similar/route.ts  POST AI clip matching
-│       ├── voiceover/route.ts        POST generate one MiniMax MP3 (Mode 2)
-│       ├── voiceover/voices/route.ts GET MiniMax voice catalog
-│       ├── voiceover/[id]/file/route.ts  GET serve a generated MP3
 │       ├── settings/route.ts         GET/POST settings
 │       ├── stats/route.ts            GET concurrency capacity
 │       └── gdrive/*                  OAuth start/callback, status, disconnect
@@ -161,9 +167,9 @@ src/
     ├── init.ts                 ensureInit — seeds defaults
     └── services/
         ├── scene-split.ts      script → Scene[] via Gemini/Claude
-        ├── tts.ts              MiniMax / 69labs / ElevenLabs / OpenAI TTS
-        ├── img2vid.ts          Grok / Veo / Kling video generation
-        ├── labs69.ts           69labs client + multi-key pool + MiniMax catalog
+        ├── tts.ts              69labs (ElevenLabs default / MiniMax alt) / ElevenLabs / OpenAI TTS
+        ├── img2vid.ts          Veo (default) / Grok (legacy) / Kling video generation
+        ├── labs69.ts           69labs client + multi-key pool + voice catalogs
         ├── video-assemble.ts   FFmpeg per-scene render + final xfade
         ├── gdrive.ts           Google Drive client
         ├── run-upload.ts       upload a finished run to Drive
@@ -192,20 +198,21 @@ scripts/
 - **run_logs** — append-only log lines streamed to the run page.
 
 The DB lives **outside** the project tree (`~/.conveyer-hum/`) so code updates
-never touch user data — alongside `runs/` (pipeline output) and `voiceovers/`
-(standalone Voiceover-tool MP3s). Schema changes use `tryAddColumn()` in `db.ts`
-(SQLite has no `ADD COLUMN IF NOT EXISTS`).
+never touch user data — alongside `runs/` (pipeline output). (A `voiceovers/`
+folder was used by the removed standalone Voiceover tool; `run-paths.ts` may
+still reference it for legacy safety.) Schema changes use `tryAddColumn()` in
+`db.ts` (SQLite has no `ADD COLUMN IF NOT EXISTS`).
 
 ---
 
 ## Core concepts
 
-- **Three modes** — Video Conveyer (full pipeline), Voiceover (standalone
-  MiniMax TTS — no pipeline, no DB run, MP3s land in `~/.conveyer-hum/voiceovers/`),
-  and Re-assembly (the Video Conveyer pipeline driven by a hand-picked
-  `reuseMap`). Re-assembly POSTs `/api/runs` with `autoReuse: false` + the map.
+- **Two modes** — Video Conveyer (full pipeline) and Re-assembly (the Video
+  Conveyer pipeline driven by a hand-picked `reuseMap`). Re-assembly POSTs
+  `/api/runs` with `autoReuse: false` + the map. (The old standalone Voiceover
+  mode has been removed.)
 - **Channel profile** — a per-channel bundle: scene_split prompt + optional
-  MiniMax voice id + optional animation-motion override + description. Picked on
+  voice id + optional animation-motion override + description. Picked on
   the New Run page. UI label "Channels"; DB table `prompt_presets`.
 - **Library reuse** — after Drive sync, the AI can match new scenes against past
   uploaded clips and skip generation for high-confidence matches.
@@ -234,7 +241,8 @@ never touch user data — alongside `runs/` (pipeline output) and `voiceovers/`
 ## How to verify a change
 
 1. `npx tsc --noEmit` — must be 0 errors.
-2. `npm run dev`, open `http://localhost:3000`, exercise the changed page.
+2. `npm run dev`, open the URL it prints (`http://localhost:3000`, or 3001/3002
+   if 3000 was taken), exercise the changed page.
 3. For pipeline changes, run a short (~30s) script end-to-end and watch the logs.
 
 ---
@@ -245,7 +253,7 @@ never touch user data — alongside `runs/` (pipeline output) and `voiceovers/`
   Conveyer Hum is text-to-AI-video only. Don't merge the two.
 - **Auto-overlay** (arrows / text / infographics) — kept as a manual editor step.
 - **Reassemble-from-disk** — the old Isabell `/api/runs/[id]/reassemble` route
-  is disabled. The new **Re-assembly mode** (Mode 3) covers the real need:
+  is disabled. The new **Re-assembly mode** (Mode 2) covers the real need:
   rebuild from the Drive clip library, not from local disk.
 
 See also: `docs/INSTALL.md`, `docs/USAGE.md`, `docs/PROMPT-GUIDE.md`, `README.md`.

@@ -1,6 +1,8 @@
 # Prompt guide — how to write a channel's Scene Split prompt
 
-This guide explains how to write a **Scene Split prompt** — the system prompt that tells the LLM (Gemini) how to slice your script into scenes and what kind of visuals to ask Grok for. It's the core of every **channel profile**.
+This guide explains how to write a **Scene Split prompt** — the system prompt that tells the LLM (Gemini) how to slice your script into scenes and what kind of visuals to ask the video model for. It's the core of every **channel profile**.
+
+> **Note on clip length.** Conveyer Hum now defaults to **Veo 3.1 Fast**, which is not capped at ~6 seconds. The scene-length rules below were written for the **legacy Grok** model, whose clips are a fixed ~6 seconds. They remain solid documentary-pacing guidance for any model, but the hard 6-second cap only applies if your channel still uses Grok. On Veo you can relax the upper bound somewhat.
 
 You write it ONCE per channel on the **Channels & Prompts** page (Add new channel), then pick that channel from a dropdown on every New Run. No need to write per-scene prompts manually — Gemini generates them automatically from your channel's rules + your script.
 
@@ -22,9 +24,9 @@ This anchors every visual decision downstream.
 
 ### 2. Scene length rules — **the most important section**
 
-The pipeline uses xAI Grok via 69labs, which returns **fixed ~6-second clips** (we cannot ask for longer — 69labs runtime blocks it). If a scene's narration is longer than 6 s, the visual freezes on the last frame. If it's shorter than ~3.5 s, the Grok clip gets trimmed and you waste the credit.
+The default video model (Veo 3.1 Fast via 69labs) is flexible on length, but tight scenes still give the best documentary pacing. The **legacy Grok** model returns **fixed ~6-second clips** (we cannot ask for longer — 69labs runtime blocks it): on Grok, if a scene's narration is longer than 6 s the visual freezes on the last frame, and if it's shorter than ~3.5 s the clip gets trimmed and you waste the credit. The rules below keep scenes Grok-safe and read well on Veo too.
 
-So every preset MUST specify:
+So every preset SHOULD specify (and MUST, if the channel uses Grok):
 
 - **TARGET**: 8–13 words / ~3.5–5.5s narration
 - **HARD MIN**: 7 words / 3.5s — anything shorter gets merged
@@ -71,9 +73,9 @@ The LLM picks one of these registers for each scene based on what the narration 
 
 ### 6. Hard bans (what to NEVER generate)
 
-Grok will gladly generate clickbait or recognizable faces if you don't forbid it. Always include explicit bans:
+The video model will gladly generate clickbait or recognizable faces if you don't forbid it. Always include explicit bans:
 
-- NO recognizable faces in close-up (Grok can't reliably render specific named people anyway)
+- NO recognizable faces in close-up (these models can't reliably render specific named people anyway)
 - NO young people, NO children
 - NO sick / hospitalized / frail imagery (channel is active aging, not decline)
 - NO on-screen text or numbers as graphics (no "70%" overlays, no big bold digits)
@@ -184,18 +186,18 @@ The same structure works for any faceless YouTube niche. Just swap:
 - **Hard bans** — what your channel never shows (each niche has its own list)
 
 **Keep**:
-- The scene length rules (the 6s cap is hard-coded by Grok via 69labs — applies to every niche)
+- The scene length rules (good pacing for any niche; the hard ~6s cap specifically applies only to the legacy Grok model)
 - The output JSON format (the pipeline parser depends on it)
 - The "treat the script as one film" continuity paragraph
-- The hard ban on recognizable faces in close-up (Grok limitation, not niche-specific)
+- The hard ban on recognizable faces in close-up (a video-model limitation, not niche-specific)
 
 ---
 
 ## Common mistakes
 
-- **Forgetting the 6-second cap** → scenes freeze on the last frame
+- **Forgetting the 6-second cap on a Grok channel** → scenes freeze on the last frame (not an issue on the default Veo model, which isn't capped at 6s)
 - **Forgetting the output JSON spec** → Gemini returns markdown that fails to parse
-- **Allowing scenes under 3.5s** → wasted Grok credits + jarring rapid cuts
-- **Listing only positive examples, no hard bans** → Grok generates clickbait or recognizable faces
+- **Allowing scenes under 3.5s** → wasted credits + jarring rapid cuts
+- **Listing only positive examples, no hard bans** → the video model generates clickbait or recognizable faces
 - **Skipping the continuity paragraph** → the output looks like 100 unrelated stock clips
 - **Trying to control individual scene prompts in the preset** — you can't. Gemini generates per-scene prompts automatically; you only define the rules. If you need specific visuals at specific moments, edit the script or use multiple presets.

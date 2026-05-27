@@ -2,11 +2,12 @@
   "name": "conveyer-hum",
   "version": "0.1.0",
   "private": true,
-  "description": "Local toolkit for AI faceless YouTube videos — three modes (Video Conveyer, Voiceover, Re-assembly) on Grok text-to-video + MiniMax voiceover, both via 69labs.",
+  "description": "Local toolkit for AI faceless YouTube videos — two modes (Video Conveyer, Re-assembly) on Veo 3.1 text-to-video + ElevenLabs voiceover, both via 69labs.",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "test": "node scripts/audit-tests/run-all.mjs",
     "postinstall": "node scripts/fix-native-binaries.mjs",
     "fix-bins": "node scripts/fix-native-binaries.mjs"
   },

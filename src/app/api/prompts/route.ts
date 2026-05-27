@@ -1,3 +1,7 @@
+// UNUSED / LATENT ENDPOINT — no current UI caller. This is the default-prompts
+// CRUD; the /prompts page uses /api/prompt-presets instead. Note that
+// lib/prompts.ts getPrompt() is still used internally by scene-split, so don't
+// remove that.
 import { NextResponse } from "next/server";
 import { ensureInit } from "@/lib/init";
 import { PROMPT_NAMES, getAllPrompts, setPrompt, type PromptName } from "@/lib/prompts";

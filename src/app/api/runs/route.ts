@@ -5,6 +5,7 @@ import { ensureInit } from "@/lib/init";
 import { runPipeline } from "@/lib/pipeline";
 import { sanitizeFolderName, pickAvailableFolderName } from "@/lib/run-paths";
 import { getPromptPreset } from "@/lib/prompts";
+import { tryParseJson, isJsonObject } from "@/lib/json-body";
 
 const insertRun = db.prepare(
   "INSERT INTO runs (id, title, folder_name, status, script, config_json) VALUES (?, ?, ?, 'pending', ?, ?)"
@@ -24,18 +25,26 @@ export async function GET() {
   return NextResponse.json(listRuns.all());
 }
 
+interface CreateRunBody {
+  title?: string;
+  script?: string;
+  /** Optional: scene_index → drive_file_id. Pipeline downloads those instead of generating. */
+  reuseMap?: Record<string, string>;
+  /** Optional: Prompt Preset id (from /prompts presets). Snapshot is stored on the run. */
+  presetId?: number | null;
+  /** Optional: true = pipeline auto-searches the library; false = manual reuseMap only. */
+  autoReuse?: boolean;
+}
+
 export async function POST(req: Request) {
   ensureInit();
-  const body = (await req.json()) as {
-    title?: string;
-    script?: string;
-    /** Optional: scene_index → drive_file_id. Pipeline downloads those instead of generating. */
-    reuseMap?: Record<string, string>;
-    /** Optional: Prompt Preset id (from /prompts presets). Snapshot is stored on the run. */
-    presetId?: number | null;
-    /** Optional: true = pipeline auto-searches the library; false = manual reuseMap only. */
-    autoReuse?: boolean;
-  };
+  // Malformed JSON is a CLIENT error (400), not a server crash (500): parse the
+  // raw text safely instead of letting `await req.json()` throw unhandled.
+  const parsed = tryParseJson(await req.text());
+  if (!parsed.ok || !isJsonObject(parsed.value)) {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+  const body = parsed.value as CreateRunBody;
   const script = (body.script ?? "").trim();
   if (!script) {
     return NextResponse.json({ error: "script is empty" }, { status: 400 });

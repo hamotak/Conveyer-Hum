@@ -12,7 +12,7 @@ Step-by-step setup for Windows 10/11 and macOS. Aimed at users with **zero progr
 - **~5 GB free disk space**
 - Stable internet (first install downloads ~600 MB)
 - A **Google account** (free — for the Gemini API key and optional Google Drive sync)
-- A **69labs.vip account** (paid subscription — covers BOTH Grok video and MiniMax voiceover)
+- A **69labs.vip account** (paid subscription — covers BOTH Veo video and ElevenLabs voiceover)
 
 > **Heads-up about the command line.** Steps below ask you to use the terminal. On Windows it's called **Command Prompt** or **PowerShell**. On macOS it's called **Terminal**. You only paste commands and press Enter — no need to understand them.
 
@@ -159,13 +159,13 @@ npm install
 
 Free tier is more than enough. No payment info required.
 
-### Key 2 — 69labs (Grok video + MiniMax voiceover)
+### Key 2 — 69labs (Veo video + ElevenLabs voiceover)
 
 1. Open https://69labs.vip
 2. Sign up / sign in, pick a plan
 3. Dashboard → **API Keys** → copy your key (starts with `vk_`)
 
-This single key covers **both** Grok video generation and the MiniMax voiceover — there is no separate TTS account to create. The MiniMax voice itself is chosen later, inside the app.
+This single key covers **both** Veo video generation and the ElevenLabs voiceover — there is no separate TTS account to create. The voice itself is chosen later, inside the app.
 
 Tip: you can paste multiple `vk_` keys later (each on its own line) to run multiple 69labs accounts in parallel.
 
@@ -187,6 +187,8 @@ You should see:
 - Local:    http://localhost:3000
 ✓ Ready in 1300ms
 ```
+
+If port 3000 is already taken, Next picks the next free port (3001, 3002, …) and prints that instead — use whichever URL it shows.
 
 **Don't close this window** — it's the running server. Keep it open while using the app. To stop the app, press **Ctrl+C** in this window.
 
@@ -217,7 +219,7 @@ You'll see the **Conveyer Hum** interface with a left sidebar.
    - `LABS69_API_KEY` — 69labs key from Part 3 Key 2
 3. Click **Save all changes**. Green checkmark = saved.
 
-That's all that's required. The MiniMax voice has a working default — change it any time in **Advanced → Voice Over (TTS)**.
+That's all that's required. The voiceover has a working default (ElevenLabs via 69labs) — change it any time in **Keys & Settings → Pipeline tab → Voice Over (TTS)**.
 
 You're ready to make videos. See [USAGE.md](./USAGE.md) for what to do next.
 
@@ -255,7 +257,7 @@ Drive sync is **optional** but strongly recommended. Every finished run auto-upl
 2. **+ Create Credentials** → **OAuth client ID**
 3. **Application type:** Web application
 4. **Name:** "Conveyer Hum Local"
-5. **Authorized redirect URIs** → **+ Add URI** → paste:
+5. **Authorized redirect URIs** → **+ Add URI** → paste the **exact callback URL the app shows**. Conveyer Hum derives this from the actual origin it's running on, so it is NOT always port 3000 — if Next started on 3001, the callback is `http://localhost:3001/api/gdrive/oauth/callback`. The **Keys & Settings → Google Drive Sync** section displays the precise URL to register; copy that. For a default install on port 3000 it is:
    ```
    http://localhost:3000/api/gdrive/oauth/callback
    ```
@@ -332,13 +334,13 @@ If sudo also fails, your Node install is corrupted — reinstall Node from https
 
 ### Port 3000 already in use
 
-Another app is using port 3000. Either close that app, or run on a different port:
+If port 3000 is taken, Next.js automatically starts on the next free port (3001, 3002, …) and prints that URL — just open whichever it shows. You can also force a port:
 
 ```
 PORT=3001 npm run dev
 ```
 
-Then open http://localhost:3001. Note: Google Drive OAuth callback is hardcoded to port 3000, so if you change ports, edit the redirect URI in your Google Cloud OAuth credentials too.
+Note: the Google Drive OAuth callback follows the app's actual origin (it is NOT hardcoded to port 3000). Whatever port the app runs on, register that exact callback URL in your Google Cloud OAuth credentials. The **Keys & Settings → Google Drive Sync** section always shows the precise URL to register.
 
 ### "Save failed: Internal Server Error" on Settings page
 

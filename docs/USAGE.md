@@ -2,7 +2,7 @@
 
 This guide assumes you've already finished installation. If not, see [INSTALL.md](./INSTALL.md).
 
-After install, you open `http://localhost:3000` in your browser and see the Conveyer Hum interface with a left sidebar. Everything happens through that interface — no editing config files, no rebuilding.
+After install, you open the app in your browser (the terminal prints the exact URL — usually `http://localhost:3000`, or 3001/3002 if 3000 was taken) and see the Conveyer Hum interface with a left sidebar. Everything happens through that interface — no editing config files, no rebuilding.
 
 ---
 
@@ -11,15 +11,13 @@ After install, you open `http://localhost:3000` in your browser and see the Conv
 | Page | What it does |
 |---|---|
 | **Video Conveyer** | Paste a script → a full video: scenes, voiceover, clips, final MP4 |
-| **Voiceover** | Standalone text-to-speech — paste text, pick a MiniMax voice, download an MP3 |
 | **Re-assembly** | Build a video mostly from clips you already have in your Drive library |
 | **Run history** | All your past runs — status, final video, logs |
 | **Library** | Browse clips from past runs on Google Drive (if Drive sync is on) |
 | **Channels & Prompts** | Channel profiles (one per channel) + default prompts |
-| **Keys & Settings** | API keys, Drive credentials |
-| **Advanced** | Voice (MiniMax) settings, video model, FFmpeg options, concurrency |
+| **Keys & Settings** | API keys, Drive credentials, and (in the **Pipeline** tab) voice settings, video model, FFmpeg options, concurrency |
 
-The first three are the **modes**; the rest are shared across all of them.
+The first two are the **modes**; the rest are shared across both. Voice/model/FFmpeg/concurrency settings used to live on a separate **Advanced** page — those have been merged into **Keys & Settings** (Pipeline tab). The old `/advanced` URL now redirects to `/settings?tab=pipeline`, so existing bookmarks still land in the right place.
 
 ---
 
@@ -30,9 +28,9 @@ The first three are the **modes**; the rest are shared across all of them.
 Go to **Keys & Settings** and fill in:
 
 - `GOOGLE_API_KEY` — your Gemini key from [aistudio.google.com](https://aistudio.google.com/app/apikey) (free)
-- `LABS69_API_KEY` — your 69labs key (starts with `vk_`). This one key powers **both** Grok video and MiniMax voiceover.
+- `LABS69_API_KEY` — your 69labs key (starts with `vk_`). This one key powers **both** Veo video and ElevenLabs voiceover.
 
-Only two keys to start. The MiniMax voice itself is chosen in **Advanced → Voice Over (TTS)**, and it already has a sensible default.
+Only two keys to start. The voice itself is chosen in **Keys & Settings → Pipeline tab → Voice Over (TTS)**, and it already has a sensible default (ElevenLabs via 69labs).
 
 Click **Reveal secret values** if you need to edit existing keys (they're masked by default).
 
@@ -42,7 +40,7 @@ Click **Save all changes**. You should see green confirmation.
 
 Default prompts work, but you'll get much better, more on-brand results with a channel profile tuned to your niche.
 
-Go to **Channels & Prompts** → **Add new channel** → fill in the channel name, optionally a MiniMax voice (this channel's own voice) and a description, then paste the Scene Split prompt → **Add channel**.
+Go to **Channels & Prompts** → **Add new channel** → fill in the channel name, optionally a voice (this channel's own voice) and a description, then paste the Scene Split prompt → **Add channel**.
 
 See [PROMPT-GUIDE.md](./PROMPT-GUIDE.md) for what to put in the Scene Split prompt and a full worked example.
 
@@ -69,8 +67,8 @@ The pipeline runs 5 phases automatically. You don't intervene — just watch the
     Your script + preset → JSON array of scenes (each with text + visual_prompt + duration)
        ↓
 [2] Per scene IN PARALLEL:
-       ├─ MiniMax TTS (via 69labs) → narration MP3
-       └─ Grok via 69labs → 6-second silent video clip
+       ├─ ElevenLabs TTS (via 69labs) → narration MP3
+       └─ Veo via 69labs → silent video clip
            (or, if you picked Library reuse: download existing clip from Drive)
        ↓
 [3] Per-scene render (FFmpeg)
@@ -96,7 +94,7 @@ These are with ONE 69labs key. Each extra key roughly halves total time (paralle
 
 ## Library reuse — save credits on similar scenes
 
-If you've connected Google Drive AND made a few runs already, the AI can browse your past clips and reuse ones that match new scenes — skipping Grok generation for those scenes entirely.
+If you've connected Google Drive AND made a few runs already, the AI can browse your past clips and reuse ones that match new scenes — skipping video generation for those scenes entirely.
 
 On the Video Conveyer page:
 
@@ -110,26 +108,6 @@ On the Video Conveyer page:
 This pays off quickly. The more videos you make, the more matches the library finds.
 
 For a dedicated, review-every-scene version of this, use the **Re-assembly** mode (below).
-
----
-
-## Voiceover — standalone text-to-speech
-
-The **Voiceover** tab is a stand-alone narration tool — no script splitting, no
-video, just voice. Use it for intros, ad reads, narration you'll edit elsewhere,
-or simply to audition voices.
-
-1. Open **Voiceover** in the sidebar
-2. Paste your text into the box
-3. Pick a **MiniMax voice** — the dropdown loads the 69labs MiniMax catalog; type
-   in the search box to filter it. Tick *"Use a custom / cloned voice id"* to
-   paste a cloned-voice id instead
-4. Optionally adjust **model**, **language boost**, and **speed**
-5. Click **Generate voiceover**
-
-The MP3 appears below with a player and a **Download MP3** button. Recent
-generations stay listed so you can compare voices. Files are kept in
-`~/.conveyer-hum/voiceovers/`.
 
 ---
 
@@ -147,13 +125,13 @@ Google Drive connected and a few past runs synced.
    - **keep** the AI's pick,
    - click a different **AI-suggested clip**,
    - **Browse library…** to assign *any* clip from your whole library, or
-   - **Generate fresh** to have Grok make a new clip for that scene
+   - **Generate fresh** to have the video model make a new clip for that scene
 4. The summary shows how many scenes are reused vs generated fresh
 5. Click **Build video** — the run starts; reused scenes download from Drive, the
-   rest generate with Grok, and every scene gets a MiniMax voiceover
+   rest generate with the video model (Veo by default), and every scene gets a voiceover
 
 This is the cheapest way to make a new video once you have a clip library — every
-reused scene is one Grok generation you don't pay for.
+reused scene is one video generation you don't pay for.
 
 ---
 
@@ -162,7 +140,7 @@ reused scene is one Grok generation you don't pay for.
 If you run multiple YouTube channels with different styles, save a profile for each on the **Channels & Prompts** page. Each profile bundles:
 
 - **Scene Split prompt** — the visual rules for this channel (required)
-- **MiniMax voice** — this channel's own voice (optional — empty uses the global voice)
+- **Voice** — this channel's own voice (optional — empty uses the global voice)
 - **Animation Motion override** — this channel's motion style (optional — empty uses the global default)
 - **Description** — a note for your own reference (optional)
 
@@ -206,7 +184,7 @@ Inside that folder:
 - `hum.db` — your settings, API keys, prompts, presets, run history
 - `runs/<run-folder>/` — per-run output (audio, animations, final.mp4)
 
-You can change `runs/` location in **Advanced settings → RUNS_OUTPUT_DIR** if you want runs on a different disk.
+You can change `runs/` location in **Keys & Settings → Pipeline tab → RUNS_OUTPUT_DIR** if you want runs on a different disk.
 
 > **macOS users** — the folder starts with a dot so Finder hides it. Press **⌘ + Shift + .** in Finder to show hidden folders, or **⌘ + Shift + G** and paste `~/.conveyer-hum/`.
 
@@ -224,7 +202,7 @@ To use multiple keys:
 
 The pipeline automatically load-balances jobs across all configured keys. Each key has its own concurrency counter; the next job goes to the least-loaded account.
 
-The header on the New Run page shows current key count and effective parallel capacity. With N keys, expect roughly N× faster generation (limited by total Grok throughput across accounts).
+The header on the New Run page shows current key count and effective parallel capacity. With N keys, expect roughly N× faster generation (limited by total video throughput across accounts).
 
 ---
 
@@ -236,7 +214,7 @@ No hard limit. The pipeline handles scripts from 30 seconds to 30+ minutes. Long
 
 ### How long can each clip be?
 
-Fixed at ~6 seconds per scene (Grok via 69labs limitation — we cannot ask for longer). The scene split prompt enforces this by keeping each scene's narration ≤ 6 seconds, so the visual doesn't freeze on the last frame.
+Depends on the video model. The default **Veo 3.1 Fast** is not capped at 6 seconds. The **legacy Grok** model (via 69labs) returns fixed ~6-second clips — we cannot ask for longer. If your channel still uses Grok, the scene split prompt should keep each scene's narration ≤ 6 seconds so the visual doesn't freeze on the last frame.
 
 ### Can I edit the final video?
 
@@ -246,9 +224,9 @@ Yes — download the MP4 and open in any editor. All raw scene clips are also sa
 
 The pipeline retries each scene up to 3 times with exponential backoff. If a scene still fails after retries, the run continues — you'll see the failed scene in the logs and final video skips that scene (or fails the whole run if too many scenes fail). For now, the easiest fix is to re-run the pipeline; **Library reuse** will pick up the scenes that succeeded last time, so only the failed ones regenerate.
 
-### Can I use different video models (Veo / Kling) instead of Grok?
+### Can I use different video models (Grok / Kling) instead of Veo?
 
-Yes — **Advanced settings → ANIMATION_MODEL**. Conveyer Hum defaults to `grok-imagine-video` because that's what this fork was built for, but you can switch to `veo-video` (Google Veo via 69labs) or other providers. Note: this is mainly for experimentation — the default prompts are tuned for Grok's 6s clip length.
+Yes — **Keys & Settings → Pipeline tab → ANIMATION_MODEL**. Conveyer Hum defaults to `veo-video` (Veo 3.1 Fast via 69labs). You can switch to `grok-imagine-video` (legacy Grok, fixed ~6s clips) or other providers. Note that if you switch to Grok, you'll want scene-split prompts tuned for its 6-second clip length.
 
 ### Where are my videos uploaded?
 
@@ -257,3 +235,7 @@ If Drive sync is on:
 - Raw clips → `Conveyer Hum/Clips Library/<run-folder>/` (scene clips + `clips.json` metadata + `description.md` human-readable summary)
 
 The "Conveyer Hum" root folder is separate from any other forks (Hum Conveyer, Conveyer Isabell, etc.) so you can run multiple variants without collisions.
+
+### Why does the Clip Library show 0 clips for a run?
+
+The **Library** page lists a run's clips only when that run's Drive **`clips.json` manifest** uploaded successfully *and* it contains clips. If the manifest upload failed or produced an empty manifest, the run shows 0 clips even though the video uploaded fine. (An earlier bug where some runs uploaded an empty manifest has been fixed — re-syncing the run regenerates a correct `clips.json`.)

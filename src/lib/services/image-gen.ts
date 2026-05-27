@@ -1,3 +1,7 @@
+// DEAD CODE — not imported anywhere. The pipeline is video-only.
+// Kept only because the IMAGE_RATIO setting is still read elsewhere as the
+// video aspect ratio (see CLAUDE.md). Safe to delete the service, but leave
+// the IMAGE_* settings.
 import fs from "node:fs";
 import path from "node:path";
 import { getSetting } from "../settings";
