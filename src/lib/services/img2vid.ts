@@ -5,6 +5,7 @@ import { getPrompt } from "../prompts";
 import { log } from "../logger";
 import type { Scene } from "./scene-split";
 import { createVideoJob, pollJob, downloadJob, cancelJob, releaseJob } from "./labs69";
+import { CancelledError, checkCancelled, isCancelled, registerJob, unregisterJob } from "../cancellation";
 
 /**
  * Generates a short video clip for a scene.
@@ -120,11 +121,12 @@ async function labs69Img2Vid(
   // Retry: timeout → cancel → retry. Same pattern as image-gen.
   const MAX_ATTEMPTS = 3;
   let lastErr: unknown;
-  let lastJobId: string | null = null;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    let jobId: string | null = null;
     try {
-      const jobId = await createVideoJob({
+      checkCancelled(runId); // before creating a paid job
+      jobId = await createVideoJob({
         prompt,
         model,
         aspectRatio,
@@ -133,27 +135,45 @@ async function labs69Img2Vid(
         mute: !keepAudio,
         runId,
       });
-      lastJobId = jobId;
+      // Track the job so Stop can actively cancel it (not just flip DB status).
+      registerJob(runId, "videos", jobId);
       log(
         runId,
         "debug",
         `69labs video job ${jobId.slice(0, 8)}… (img2vid${usableJobId ? ", reusing image" : ", text-only"}, attempt=${attempt})`,
         { stage: "animate" }
       );
+      checkCancelled(runId); // before polling
       await pollJob("videos", jobId, runId, "animate");
+      checkCancelled(runId); // after polling, before download
       await downloadJob("videos", jobId, outPath);
+      unregisterJob(runId, jobId);
       return;
     } catch (e) {
+      if (jobId) unregisterJob(runId, jobId);
+
+      // User pressed Stop: cancel the paid job and bail immediately — do NOT
+      // retry (that would spend more credits on a run the user is killing).
+      if (isCancelled(runId) || e instanceof CancelledError) {
+        if (jobId) {
+          const cancelled = await cancelJob("videos", jobId).catch(() => false);
+          log(runId, "debug", `Cancelled video ${jobId.slice(0, 8)} → ${cancelled ? "ok" : "skipped"}`, {
+            stage: "animate",
+          });
+        }
+        throw e instanceof CancelledError ? e : new CancelledError(`Run ${runId} cancelled`);
+      }
+
       lastErr = e;
       const msg = e instanceof Error ? e.message : String(e);
-      if (lastJobId) {
+      if (jobId) {
         if (/polling timeout/i.test(msg)) {
-          const cancelled = await cancelJob("videos", lastJobId);
-          log(runId, "debug", `Cancelled video ${lastJobId.slice(0, 8)} → ${cancelled ? "ok" : "skipped"}`, {
+          const cancelled = await cancelJob("videos", jobId);
+          log(runId, "debug", `Cancelled video ${jobId.slice(0, 8)} → ${cancelled ? "ok" : "skipped"}`, {
             stage: "animate",
           });
         } else {
-          releaseJob(lastJobId);
+          releaseJob(jobId);
         }
       }
       if (attempt < MAX_ATTEMPTS) {

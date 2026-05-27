@@ -25,7 +25,7 @@ const POLL_INTERVAL_MS = 2500;
 // without keeping zombie polls alive forever.
 const POLL_MAX_MS = 8 * 60 * 1000;
 
-type JobKind = "tts" | "images" | "videos";
+export type JobKind = "tts" | "images" | "videos";
 type JobStatus = "PENDING" | "PROCESSING" | "FINALIZING" | "COMPLETED" | "FAILED" | "CANCELLED" | "CENSORED";
 
 // ── Key pool ────────────────────────────────────────────────────────────────
