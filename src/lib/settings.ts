@@ -1,4 +1,8 @@
 import db from "./db";
+import { isSecretKey } from "./secret-keys";
+
+// Re-export so server code can keep importing the secret-key helper from here.
+export { isSecretKey, isMaskedValue, MASK_CHAR } from "./secret-keys";
 
 /**
  * Keys the user can edit through the UI or via .env.
@@ -94,11 +98,6 @@ export const SETTING_KEYS = [
   // Master switch. Empty/"0" = disabled (don't upload). "1" = upload after every run.
   "GDRIVE_SYNC_ENABLED",
 ] as const;
-
-/** Keys whose values are secrets and should be masked when sent to the UI. */
-function isSecretKey(key: string): boolean {
-  return key.includes("KEY") || key.includes("TOKEN") || key.includes("SECRET");
-}
 
 export type SettingKey = (typeof SETTING_KEYS)[number];
 

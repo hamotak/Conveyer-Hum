@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { ensureInit } from "@/lib/init";
 import { SETTING_KEYS, getMaskedSettings, getAllSettings, getSetting, setSetting, type SettingKey } from "@/lib/settings";
+import { isSecretKey, isMaskedValue } from "@/lib/secret-keys";
 import { applyRunsRoot } from "@/lib/run-paths";
 
 export async function GET(req: Request) {
@@ -41,8 +42,11 @@ export async function POST(req: Request) {
     // BACK to us — overwriting the real key in the DB with a broken value.
     // The corrupted key then breaks every API call ("Cannot convert argument
     // to a ByteString because the character at index N has a value of 8230").
-    const isSecretField = k.includes("KEY") || k.includes("TOKEN");
-    if (isSecretField && next.includes("…")) {
+    //
+    // Uses the SHARED isSecretKey so this can't drift from the masker again —
+    // the old inline check matched KEY/TOKEN but not SECRET, so a masked
+    // GDRIVE_CLIENT_SECRET slipped through and clobbered the real one.
+    if (isSecretKey(k) && isMaskedValue(next)) {
       continue; // keep existing DB value untouched
     }
 
