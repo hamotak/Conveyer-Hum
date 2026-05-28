@@ -27,14 +27,19 @@ export interface AssembleInput {
 export async function assembleVideo(
   runId: string,
   scenes: AssembleInput[],
-  outDir: string
+  outDir: string,
+  /** Per-channel scene-end pause (seconds). null/undefined → global SCENE_TAIL_SILENCE. */
+  pauseOverride?: number | null
 ): Promise<string> {
   ensureFfmpegPaths();
 
   const resolution = getSetting("VIDEO_RESOLUTION") || "1920x1080";
   const fps = Number(getSetting("VIDEO_FPS") || "30");
   const transitionSec = Number(getSetting("TRANSITION_DURATION") || "0.5");
-  const tailSilence = Math.max(0, Number(getSetting("SCENE_TAIL_SILENCE") || "0.4"));
+  const tailSilence = Math.max(
+    0,
+    pauseOverride != null ? pauseOverride : Number(getSetting("SCENE_TAIL_SILENCE") || "0.4")
+  );
   const assembleConcurrency = Math.max(1, Number(getSetting("ASSEMBLE_CONCURRENCY") || "4"));
   const [w, h] = resolution.split("x").map(Number);
 
@@ -450,5 +455,254 @@ function concatWithCrossfade(
       .on("error", reject)
       .on("end", () => resolve())
       .save(finalPath);
+  });
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Continuous voiceover assembly (Prompt 7 + 8)
+//
+// One TTS call produces the entire narration (no inter-scene seams). Each scene
+// clip plays at its NATIVE Veo length — no slot-fitting, no freeze frames. The
+// pipeline guarantees the clips together cover the audio (it generates a buffer
+// clip when they're short), so after crossfade-concat + audio overlay we simply
+// trim the output to the audio length. Any video overhang is cut silently; the
+// only frame manipulation is the 0.5s edge fades. NO `tpad=stop_mode=clone`.
+// ───────────────────────────────────────────────────────────────────────────
+
+const CONTINUOUS_CROSSFADE = 0.3;
+const EDGE_FADE = 0.5;
+const MIN_CLIP_SEC = 2.0;
+
+/** One clip to assemble. `targetSec` = the scene's narrated window to TRIM the
+ *  clip to (Prompt 10); null = keep native length (used for the buffer clip). */
+export interface AssemblyClip {
+  path: string;
+  targetSec: number | null;
+}
+
+export async function assembleContinuous(
+  runId: string,
+  clips: AssemblyClip[],
+  audioPath: string,
+  outDir: string
+): Promise<string> {
+  ensureFfmpegPaths();
+  const resolution = getSetting("VIDEO_RESOLUTION") || "1920x1080";
+  const fps = Number(getSetting("VIDEO_FPS") || "30");
+  const assembleConcurrency = Math.max(1, Number(getSetting("ASSEMBLE_CONCURRENCY") || "4"));
+  const [w, h] = resolution.split("x").map(Number);
+
+  const clipsDir = path.join(outDir, "clips");
+  if (!fs.existsSync(clipsDir)) fs.mkdirSync(clipsDir, { recursive: true });
+
+  const audioDur = await probeDuration(audioPath);
+  log(runId, "info", `Continuous assembly: ${clips.length} clips over ${audioDur.toFixed(1)}s of audio`, {
+    stage: "assemble",
+  });
+
+  // 1. Render each clip to the output resolution, TRIMMED to its narrated window
+  //    (so every scene's visual plays during its own narration — no discard).
+  const limitClip = pLimit(assembleConcurrency);
+  const clipInfos = await Promise.all(
+    clips.map((clip, i) =>
+      limitClip(async () => {
+        const clipPath = path.join(clipsDir, `clip_${String(i).padStart(3, "0")}.mp4`);
+        const durationSec = await renderClip(runId, i, clip, clipPath, w, h, fps);
+        return { path: clipPath, durationSec };
+      })
+    )
+  );
+
+  // 2. Crossfade the silent clips into one video stream.
+  const silentPath = path.join(outDir, "silent.mp4");
+  if (clipInfos.length >= 2) {
+    await concatVideoCrossfade(clipInfos, silentPath, CONTINUOUS_CROSSFADE, fps);
+  } else {
+    fs.copyFileSync(clipInfos[0].path, silentPath);
+  }
+
+  // 3. Lay the continuous audio over it, trim to the audio length, add edge fades.
+  const finalPath = path.join(outDir, "final.mp4");
+  await muxAudioWithFades(silentPath, audioPath, finalPath, audioDur, fps);
+  try {
+    fs.unlinkSync(silentPath);
+  } catch {}
+
+  log(runId, "success", `Final video: ${finalPath} (${audioDur.toFixed(1)}s)`, { stage: "assemble" });
+  return finalPath;
+}
+
+/**
+ * Re-encode a clip to the output resolution (silent), TRIMMED to its scene's
+ * narrated window when `targetSec` is set. Pure tail-cut via `-t` — no pad, no
+ * freeze. `targetSec` null → keep native length (buffer clip). Returns the
+ * rendered duration.
+ */
+async function renderClip(
+  runId: string,
+  index: number,
+  clip: AssemblyClip,
+  outPath: string,
+  w: number,
+  h: number,
+  fps: number
+): Promise<number> {
+  const native = await probeDuration(clip.path);
+  // Never request more than we have; floor at MIN_CLIP_SEC so a clip is watchable.
+  const target =
+    clip.targetSec != null ? Math.min(native, Math.max(MIN_CLIP_SEC, clip.targetSec)) : native;
+  if (clip.targetSec != null) {
+    log(
+      runId,
+      "debug",
+      `trim scene_${index} from ${native.toFixed(1)}s to ${target.toFixed(1)}s`,
+      { stage: "assemble" }
+    );
+  }
+  await new Promise<void>((resolve, reject) => {
+    const cmd = ffmpeg()
+      .input(clip.path)
+      .videoFilters(`scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h}`);
+    const opts = ["-an", `-r ${fps}`, "-c:v libx264", "-preset veryfast", "-crf 23", "-pix_fmt yuv420p", "-movflags +faststart"];
+    if (clip.targetSec != null) opts.unshift(`-t ${target.toFixed(3)}`);
+    cmd
+      .outputOptions(opts)
+      .on("error", reject)
+      .on("end", () => resolve())
+      .save(outPath);
+  });
+  return target;
+}
+
+/**
+ * Buffer-clip fallback (Prompt 8): when a fresh Veo buffer clip can't be made,
+ * build a slow Ken-Burns clip from the LAST scene clip's final frame. Motion
+ * (gentle zoom), never a frozen hold. Returns the path written.
+ */
+export async function kenBurnsBufferFromClip(
+  clipPath: string,
+  outPath: string,
+  w: number,
+  h: number,
+  fps: number,
+  durationSec: number
+): Promise<string> {
+  ensureFfmpegPaths();
+  const framePath = outPath.replace(/\.mp4$/i, "_frame.png");
+  // Grab a frame from very near the end of the source clip.
+  await new Promise<void>((resolve, reject) => {
+    ffmpeg(clipPath)
+      .inputOptions(["-sseof", "-0.2"])
+      .outputOptions(["-frames:v", "1", "-q:v", "2"])
+      .on("error", reject)
+      .on("end", () => resolve())
+      .save(framePath);
+  });
+  const totalFrames = Math.max(2, Math.ceil(durationSec * fps));
+  const zoomExpr = `min(1.0+0.12*on/${totalFrames - 1},1.12)`;
+  const filter = `scale=${w * 2}:${h * 2}:flags=lanczos,zoompan=z='${zoomExpr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${w}x${h}:fps=${fps}`;
+  await new Promise<void>((resolve, reject) => {
+    ffmpeg()
+      .input(framePath)
+      .inputOptions(["-loop 1"])
+      .videoFilters(filter)
+      .outputOptions([
+        "-an",
+        `-r ${fps}`,
+        `-t ${durationSec.toFixed(3)}`,
+        "-c:v libx264",
+        "-preset veryfast",
+        "-crf 23",
+        "-pix_fmt yuv420p",
+        "-movflags +faststart",
+      ])
+      .on("error", reject)
+      .on("end", () => resolve())
+      .save(outPath);
+  });
+  try {
+    fs.unlinkSync(framePath);
+  } catch {}
+  return outPath;
+}
+
+/** Video-only crossfade chain (silent clips). */
+function concatVideoCrossfade(
+  clips: { path: string; durationSec: number }[],
+  outPath: string,
+  fadeDur: number,
+  fps: number
+): Promise<void> {
+  const cmd = ffmpeg();
+  for (const c of clips) cmd.input(c.path);
+  let videoChain = "";
+  let lastV = "0:v";
+  let cumOffset = 0;
+  for (let i = 1; i < clips.length; i++) {
+    cumOffset += clips[i - 1].durationSec - fadeDur;
+    const vOut = `v${i}`;
+    videoChain += `[${lastV}][${i}:v]xfade=transition=fade:duration=${fadeDur}:offset=${cumOffset.toFixed(3)}[${vOut}];`;
+    lastV = vOut;
+  }
+  const filterComplex = videoChain.replace(/;$/, "");
+  return new Promise((resolve, reject) => {
+    cmd
+      .complexFilter(filterComplex)
+      .outputOptions([
+        `-map [${lastV}]`,
+        "-an",
+        `-r ${fps}`,
+        "-c:v libx264",
+        "-preset veryfast",
+        "-crf 22",
+        "-pix_fmt yuv420p",
+        "-movflags +faststart",
+      ])
+      .on("error", reject)
+      .on("end", () => resolve())
+      .save(outPath);
+  });
+}
+
+/**
+ * Overlay the continuous audio onto the silent video, TRIM to the audio length,
+ * add 0.5s edge fades. The pipeline guarantees video ≥ audio, so trimming the
+ * overhang leaves no black/freeze — no padding/clone here.
+ */
+async function muxAudioWithFades(
+  videoPath: string,
+  audioPath: string,
+  outPath: string,
+  audioDur: number,
+  fps: number
+): Promise<void> {
+  const fade = Math.min(EDGE_FADE, audioDur / 2);
+  const outStart = Math.max(0, audioDur - fade);
+
+  const vchain = `fade=t=in:st=0:d=${fade.toFixed(3)},fade=t=out:st=${outStart.toFixed(3)}:d=${fade.toFixed(3)}`;
+  const achain = `afade=t=in:st=0:d=${fade.toFixed(3)},afade=t=out:st=${outStart.toFixed(3)}:d=${fade.toFixed(3)}`;
+  const filterComplex = `[0:v]${vchain}[v];[1:a]${achain}[a]`;
+
+  return new Promise((resolve, reject) => {
+    ffmpeg()
+      .input(videoPath)
+      .input(audioPath)
+      .complexFilter(filterComplex)
+      .outputOptions([
+        "-map [v]",
+        "-map [a]",
+        `-r ${fps}`,
+        `-t ${audioDur.toFixed(3)}`,
+        "-c:v libx264",
+        "-preset veryfast",
+        "-crf 22",
+        "-pix_fmt yuv420p",
+        "-c:a aac",
+        "-b:a 192k",
+        "-movflags +faststart",
+      ])
+      .on("error", reject)
+      .on("end", () => resolve())
+      .save(outPath);
   });
 }

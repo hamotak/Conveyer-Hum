@@ -14,7 +14,7 @@ const setReuseMap = db.prepare(
   "UPDATE runs SET reuse_map_json = ? WHERE id = ?"
 );
 const setPresetSnapshot = db.prepare(
-  "UPDATE runs SET preset_id = ?, preset_name = ?, preset_content = ?, preset_animation_motion = ?, preset_image_prompt = ?, preset_voice_id = ? WHERE id = ?"
+  "UPDATE runs SET preset_id = ?, preset_name = ?, preset_content = ?, preset_animation_motion = ?, preset_image_prompt = ?, preset_voice_id = ?, preset_video_style = ?, preset_voice_speed = ?, preset_scene_pause = ?, preset_voice_provider = ?, preset_style_preset_id = ?, preset_video_model = ?, preset_aspect_ratio = ?, preset_voice_stability = ?, preset_voice_similarity_boost = ?, preset_voice_style = ? WHERE id = ?"
 );
 const listRuns = db.prepare(
   "SELECT id, title, folder_name, status, created_at, updated_at, output_path FROM runs ORDER BY created_at DESC LIMIT 50"
@@ -88,6 +88,16 @@ export async function POST(req: Request) {
         preset.animation_motion,
         preset.image_prompt,
         preset.voice_id,
+        preset.video_style,
+        preset.voice_speed,
+        preset.scene_end_pause_seconds,
+        preset.voice_provider,
+        preset.style_preset_id,
+        preset.video_model,
+        preset.aspect_ratio,
+        preset.voice_stability,
+        preset.voice_similarity_boost,
+        preset.voice_style,
         id
       );
     }

@@ -8,7 +8,7 @@
  * "two children with the same key" warning (observed: saved:G17SuINrv2H9FC6nvetn).
  * voiceUid now keys saved voices off their unique DB id, so keys never collide.
  */
-import { voiceUid } from "../../src/lib/voice-key.ts";
+import { voiceUid, selectedVoiceUid } from "../../src/lib/voice-key.ts";
 
 let failures = 0;
 function check(label: string, cond: boolean): void {
@@ -37,6 +37,17 @@ check("duplicate saved voiceIds get distinct keys", keys[0] !== keys[1]);
 check("saved keys use the DB id", keys[0] === "saved:row-1" && keys[1] === "saved:row-2");
 check("library voice keeps source:voiceId", keys[3] === "library:G17SuINrv2H9FC6nvetn");
 check("all keys are unique", new Set(keys).size === keys.length);
+
+console.log("Selected-voice uniqueness (only one row highlights):");
+{
+  // Two saved voices share the same voiceId; only the first should be selected.
+  const sel = selectedVoiceUid(voices, "G17SuINrv2H9FC6nvetn");
+  check("selected uid resolves to the FIRST matching saved row", sel === "saved:row-1");
+  const exactlyOne = voices.filter((v) => voiceUid(v) === sel).length;
+  check("exactly one row matches the selected uid", exactlyOne === 1);
+  check("no selection when id is null", selectedVoiceUid(voices, null) === null);
+  check("no selection when id is absent from the list", selectedVoiceUid(voices, "does-not-exist") === null);
+}
 
 if (failures > 0) {
   console.error(`\n${failures} check(s) failed.`);

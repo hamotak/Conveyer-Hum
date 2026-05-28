@@ -323,8 +323,11 @@ export async function createImageJob(opts: {
   aspectRatio?: string;
   resolution?: string;
   imageUrls?: string[];
+  /** Optional — enables rate-limit (429) wait logging into the run log. */
+  runId?: string;
 }): Promise<string> {
   const key = pool.pick();
+  const ctx = opts.runId ? { runId: opts.runId, stage: "image" } : undefined;
   try {
     const body: Record<string, unknown> = { prompt: opts.prompt };
     if (opts.model) body.model = opts.model;
@@ -335,7 +338,8 @@ export async function createImageJob(opts: {
     const resp = await postJsonWithKey<JobCreatedResponse | MultiJobCreatedResponse>(
       "/images/generate",
       body,
-      key
+      key,
+      ctx
     );
     const id = "jobs" in resp ? resp.jobs[0].id : resp.id;
     jobKeyMap.set(id, key);
@@ -477,8 +481,14 @@ export async function cancelJob(kind: JobKind, jobId: string): Promise<boolean> 
 }
 
 /** Downloads a completed job's output. Releases the key slot. */
-export async function downloadJob(kind: JobKind, jobId: string, outPath: string): Promise<void> {
+export async function downloadJob(
+  kind: JobKind,
+  jobId: string,
+  outPath: string,
+  opts: { keepBindingOnSuccess?: boolean } = {}
+): Promise<void> {
   const key = keyFor(jobId);
+  let downloaded = false;
   try {
     const r = await fetch(`${BASE}/${kind}/download/${jobId}`, {
       headers: { Authorization: `Bearer ${key}` },
@@ -489,8 +499,13 @@ export async function downloadJob(kind: JobKind, jobId: string, outPath: string)
     }
     const buf = Buffer.from(await r.arrayBuffer());
     fs.writeFileSync(outPath, buf);
+    downloaded = true;
   } finally {
-    releaseJob(jobId);
+    if (downloaded && opts.keepBindingOnSuccess) {
+      pool.release(key);
+    } else {
+      releaseJob(jobId);
+    }
   }
 }
 

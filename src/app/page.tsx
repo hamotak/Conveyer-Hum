@@ -1,8 +1,12 @@
 "use client";
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { usePersistedState } from "./_use-persisted-state";
+import { VoiceLibraryModal, type VoiceOption } from "./_voice-library-modal";
+import { ChannelFields, type ChannelFieldsValue } from "./_channel-fields";
+import { estimateScript } from "@/lib/script-estimate";
+import type { PreflightResult } from "@/lib/preflight";
 
 // Rough estimate: TTS narration averages ~150 words per minute
 const WORDS_PER_MINUTE = 150;
@@ -22,6 +26,7 @@ interface StatsResp {
   xfadeChunks: number;
   animationEnabled: boolean;
   animationRatio: number;
+  videoModelLabel: string;
 }
 
 interface Scene {
@@ -50,6 +55,58 @@ interface GdriveStatus {
   connected: boolean;
 }
 
+/** Maps a global setting key ↔ each ChannelFields field. */
+const INLINE_KEY: Record<keyof ChannelFieldsValue, string> = {
+  stylePresetId: "STYLE_PRESET_ID",
+  videoStyle: "VIDEO_STYLE",
+  videoModel: "ANIMATION_MODEL",
+  aspectRatio: "IMAGE_RATIO",
+  voiceSpeed: "TTS_SPEED",
+  voiceStability: "TTS_STABILITY",
+  voiceSimilarity: "TTS_SIMILARITY_BOOST",
+  voiceStyle: "TTS_STYLE",
+};
+
+/** Run-relevant globals, editable on the New Run page when no channel is picked.
+ *  Shares the channel form's layout (Style preset / Voice / Video) bound to globals. */
+function InlineSettingsCard({
+  settings,
+  onChange,
+  selectedVoiceLabel,
+  onOpenVoicePicker,
+}: {
+  settings: Record<string, string>;
+  onChange: (key: string, value: string) => void;
+  selectedVoiceLabel: string | null;
+  onOpenVoicePicker: () => void;
+}) {
+  const cf: ChannelFieldsValue = {
+    stylePresetId: settings.STYLE_PRESET_ID || "sleep-calm",
+    videoStyle: settings.VIDEO_STYLE ?? "",
+    videoModel: settings.ANIMATION_MODEL || "veo-video",
+    aspectRatio: settings.IMAGE_RATIO || "16:9",
+    voiceSpeed: settings.TTS_SPEED ?? "",
+    voiceStability: settings.TTS_STABILITY ?? "",
+    voiceSimilarity: settings.TTS_SIMILARITY_BOOST ?? "",
+    voiceStyle: settings.TTS_STYLE ?? "",
+  };
+  function applyPatch(patch: Partial<ChannelFieldsValue>) {
+    for (const [k, v] of Object.entries(patch)) {
+      onChange(INLINE_KEY[k as keyof ChannelFieldsValue], v as string);
+    }
+  }
+  // No wrapper box/header: this renders inside the home "Options" drawer, which
+  // already provides the grouping — avoids card-inside-card nesting.
+  return (
+    <ChannelFields
+      value={cf}
+      onChange={applyPatch}
+      voiceLabel={selectedVoiceLabel}
+      onOpenVoicePicker={onOpenVoicePicker}
+    />
+  );
+}
+
 export default function NewRunPage() {
   // Persisted across navigation so a pasted script isn't lost on a tab switch.
   const [title, setTitle] = usePersistedState("newrun.title", "");
@@ -57,6 +114,7 @@ export default function NewRunPage() {
   const [busy, setBusy] = useState(false);
   const [stats, setStats] = useState<StatsResp | null>(null);
   const [drive, setDrive] = useState<GdriveStatus | null>(null);
+  const [preflight, setPreflight] = useState<PreflightResult | null>(null);
 
   // Library preview state
   const [scenes, setScenes] = useState<Scene[] | null>(null);
@@ -66,8 +124,16 @@ export default function NewRunPage() {
   const [reuseMap, setReuseMap] = useState<Record<number, string>>({});
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
 
-  // Channel profiles
-  const [presets, setPresets] = useState<{ id: number; name: string }[]>([]);
+  // Channel profiles (full rows so we can show override badges + counts)
+  const [presets, setPresets] = useState<
+    {
+      id: number;
+      name: string;
+      video_style: string | null;
+      voice_speed: number | null;
+      scene_end_pause_seconds: number | null;
+    }[]
+  >([]);
   const [selectedPresetId, setSelectedPresetId] = usePersistedState<number | null>(
     "newrun.channel",
     null
@@ -81,6 +147,52 @@ export default function NewRunPage() {
     "newrun.reuseMode",
     "auto"
   );
+
+  // Global run settings — editable inline on this page when no channel is
+  // selected. Writes go to the same /api/settings store the Advanced page uses.
+  const [settings, setSettings] = useState<Record<string, string>>({});
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingRef = useRef<Record<string, string>>({});
+  function updateSetting(key: string, value: string) {
+    setSettings((s) => ({ ...s, [key]: value }));
+    pendingRef.current[key] = value;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      const body = pendingRef.current;
+      pendingRef.current = {};
+      fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }).catch(() => {});
+    }, 600);
+  }
+
+  // Voice library picker (global voice).
+  const [voiceModalOpen, setVoiceModalOpen] = useState(false);
+  const [selectedVoiceLabel, setSelectedVoiceLabel] = useState<string | null>(null);
+  // Resolve the current global voice id → a human label for the picker button.
+  useEffect(() => {
+    const vid = settings.TTS_VOICE_ID;
+    if (!vid) {
+      setSelectedVoiceLabel(null);
+      return;
+    }
+    fetch("/api/voices")
+      .then((r) => r.json())
+      .then((j: { voices: VoiceOption[] }) => {
+        const match = j.voices?.find((v) => v.voiceId === vid);
+        setSelectedVoiceLabel(match ? match.name : vid);
+      })
+      .catch(() => setSelectedVoiceLabel(vid));
+  }, [settings.TTS_VOICE_ID]);
+
+  function onSelectVoice(v: VoiceOption) {
+    updateSetting("TTS_VOICE_ID", v.voiceId);
+    updateSetting("TTS_VOICE_PROVIDER", v.provider);
+    setSelectedVoiceLabel(v.name);
+    setVoiceModalOpen(false);
+  }
 
   const AUTO_PICK_THRESHOLD = 80;
   const router = useRouter();
@@ -96,8 +208,16 @@ export default function NewRunPage() {
       .catch(() => setDrive(null));
     fetch("/api/prompt-presets")
       .then((r) => r.json())
-      .then((rows: { id: number; name: string }[]) => setPresets(rows))
+      .then(setPresets)
       .catch(() => setPresets([]));
+    fetch("/api/settings")
+      .then((r) => r.json())
+      .then(setSettings)
+      .catch(() => setSettings({}));
+    fetch("/api/preflight")
+      .then((r) => r.json())
+      .then(setPreflight)
+      .catch(() => setPreflight(null));
   }, []);
 
   const scriptStats = useMemo(() => {
@@ -115,6 +235,9 @@ export default function NewRunPage() {
       narrationSeconds: seconds,
     };
   }, [script]);
+
+  // Shared long-run estimate (drives the preflight confirm + the "long video" note).
+  const scriptEstimate = useMemo(() => estimateScript(scriptStats.words), [scriptStats.words]);
 
   const timeEstimate = useMemo(() => {
     if (!stats || scriptStats.scenes === 0) return null;
@@ -217,6 +340,24 @@ export default function NewRunPage() {
   }
 
   async function start() {
+    // Preflight: don't let a run start if a required check failed. Fail-open if
+    // preflight hasn't loaded yet (null) — the server-side run will still error
+    // on a genuinely missing key; we just don't block the click on a slow fetch.
+    const fails = preflight?.checks.filter((c) => c.required && c.status === "fail") ?? [];
+    if (fails.length > 0) {
+      alert(
+        `Can't start the run yet:\n\n${fails.map((c) => `• ${c.label}: ${c.detail}`).join("\n")}\n\nFix these in Settings, then try again.`
+      );
+      return;
+    }
+    // Long scripts: warn + require confirmation (short runs are never blocked).
+    if (scriptEstimate.isLong) {
+      const ok = window.confirm(
+        `${scriptEstimate.warnings.join("\n\n")}\n\nStart this full-length run anyway?`
+      );
+      if (!ok) return;
+    }
+
     setBusy(true);
     try {
       const body: {
@@ -247,9 +388,8 @@ export default function NewRunPage() {
   return (
     <div>
       <h1>Video Conveyer</h1>
-      <p className="muted" style={{ marginBottom: 24, fontSize: 14 }}>
-        Paste a script — the system splits it into scenes, generates voiceover and video, then
-        assembles the final MP4. Optionally preview scenes first and reuse clips from past runs.
+      <p className="muted" style={{ marginBottom: 20, fontSize: 13.5 }}>
+        Paste a script — get a finished video.
       </p>
 
       <div className="card" style={{ display: "grid", gap: 16 }}>
@@ -283,7 +423,7 @@ export default function NewRunPage() {
             ))}
           </select>
           <div className="faint" style={{ fontSize: 12, marginTop: 5 }}>
-            Picks the scene-split prompt, voice and motion for this channel. Manage in Channels &amp; Prompts.
+            Sets the prompt, voice and look. Manage in Channels.
           </div>
           {presets.length === 0 && (
             <div style={{ marginTop: 6 }}>
@@ -298,35 +438,7 @@ export default function NewRunPage() {
           )}
         </div>
 
-        <div>
-          <label className="label">Library reuse</label>
-          <div style={{ display: "flex", gap: 8 }}>
-            <button
-              type="button"
-              className={reuseMode === "auto" ? "btn btn-sm" : "btn-secondary btn-sm"}
-              onClick={() => {
-                setReuseMode("auto");
-                setMatches(null);
-                setReuseMap({});
-              }}
-            >
-              Auto
-            </button>
-            <button
-              type="button"
-              className={reuseMode === "manual" ? "btn btn-sm" : "btn-secondary btn-sm"}
-              onClick={() => setReuseMode("manual")}
-            >
-              Manual
-            </button>
-          </div>
-          <div className="faint" style={{ fontSize: 12, marginTop: 5, lineHeight: 1.5 }}>
-            {reuseMode === "auto"
-              ? "The app searches your Drive library and reuses matching clips automatically — scenes with no match are generated. Just press Run pipeline."
-              : "Preview the scenes, search the library, and pick which clips to reuse yourself."}
-          </div>
-        </div>
-
+        {/* Script — the composer's center. */}
         <div>
           <label className="label">Script</label>
           <textarea
@@ -339,50 +451,140 @@ export default function NewRunPage() {
               setMatches(null);
               setReuseMap({});
             }}
-            placeholder="Paste the full narrator script here..."
+            placeholder="Paste the full narrator script here…"
           />
           <div
-            style={{
-              display: "flex",
-              gap: 18,
-              marginTop: 10,
-              fontSize: 13,
-              color: "var(--fg-muted)",
-              flexWrap: "wrap",
-            }}
+            className="faint"
+            style={{ display: "flex", gap: 14, marginTop: 8, fontSize: 12, flexWrap: "wrap" }}
           >
-            <span>
-              <strong style={{ color: "var(--fg)" }}>{scriptStats.words}</strong> words
-            </span>
-            <span>
-              <strong style={{ color: "var(--fg)" }}>{scriptStats.chars}</strong> chars
-            </span>
-            <span>
-              ≈ <strong style={{ color: "var(--accent-hover)" }}>{scriptStats.duration}</strong> final video
-            </span>
-            <span>
-              ≈ <strong style={{ color: "var(--fg)" }}>{scriptStats.scenes}</strong> scenes
-            </span>
+            <span>{scriptStats.words} words</span>
+            <span>≈ {scriptStats.duration} video</span>
+            <span>≈ {scriptStats.scenes} scenes</span>
           </div>
         </div>
 
+        {/* Primary actions — always visible directly under the script. */}
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           <button className="btn" onClick={start} disabled={busy || !script.trim()}>
             {busy
               ? "Starting…"
               : reuseCount > 0
-                ? `Run pipeline · reusing ${reuseCount} clip${reuseCount === 1 ? "" : "s"}`
-                : "Run pipeline"}
+                ? `Run · reusing ${reuseCount} clip${reuseCount === 1 ? "" : "s"}`
+                : "Run"}
           </button>
           <button
             className="btn-secondary"
             onClick={previewScenes}
             disabled={previewing || !script.trim()}
-            title="See the scenes before running. Lets you pick reusable clips from past runs."
+            title="Split the script into scenes before running — lets you reuse clips from past runs."
           >
-            {previewing ? "Splitting…" : scenes ? "Re-split scenes" : "Preview scenes first"}
+            {previewing ? "Splitting…" : scenes ? "Re-split" : "Preview"}
           </button>
         </div>
+
+        {/* Preflight — required checks gate the run; failures link to Settings. */}
+        {preflight && !preflight.ready && (
+          <div
+            style={{
+              fontSize: 12.5,
+              lineHeight: 1.5,
+              padding: "9px 12px",
+              borderRadius: "var(--r-sm)",
+              background: "var(--warning-soft)",
+              border: "1px solid rgba(252,211,77,0.3)",
+              color: "var(--warning)",
+            }}
+          >
+            <strong>Not ready to run.</strong>{" "}
+            {preflight.checks.filter((c) => c.required && c.status === "fail").map((c) => c.label).join(", ")} —{" "}
+            fix in <a href="/settings">Settings</a>.
+          </div>
+        )}
+        {preflight?.ready && (
+          <div className="faint" style={{ fontSize: 12 }}>
+            ✓ Ready to run
+            {scriptEstimate.isLong && (
+              <span style={{ color: "var(--warning)" }}>
+                {" "}· long video (~{Math.round(scriptEstimate.minutes)} min, ~{scriptEstimate.scenes} scenes) — you&apos;ll
+                confirm before it starts.
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* Working with long videos — short, practical chaptering advice. */}
+        <details>
+          <summary style={{ cursor: "pointer", fontSize: 12.5, color: "var(--fg-muted)" }}>
+            Working with long videos
+          </summary>
+          <ol style={{ paddingLeft: 20, margin: "8px 0 0", color: "var(--fg-muted)", fontSize: 12.5, lineHeight: 1.7 }}>
+            <li>Test a <strong>1-minute</strong> script first to confirm voice + look.</li>
+            <li>Then a <strong>5–10 minute</strong> run to check pacing and reliability.</li>
+            <li>Then <strong>20–30 minutes</strong> once you trust the settings.</li>
+            <li>For <strong>~1 hour</strong>, run it as separate chapters, not one job.</li>
+          </ol>
+        </details>
+
+        {/* Options — style, voice, reuse, video. Collapsed until needed. */}
+        <details>
+          <summary style={{ cursor: "pointer", fontSize: 13, fontWeight: 550, color: "var(--fg-muted)" }}>
+            Options{selectedPresetId == null ? " · style, voice, reuse, video" : ""}
+          </summary>
+          <div style={{ display: "grid", gap: 16, marginTop: 14 }}>
+            {selectedPresetId == null ? (
+              <InlineSettingsCard
+                settings={settings}
+                onChange={updateSetting}
+                selectedVoiceLabel={selectedVoiceLabel}
+                onOpenVoicePicker={() => setVoiceModalOpen(true)}
+              />
+            ) : (
+              (() => {
+                const sel = presets.find((p) => p.id === selectedPresetId);
+                const n = sel
+                  ? [sel.video_style, sel.voice_speed, sel.scene_end_pause_seconds].filter(
+                      (v) => v != null && v !== ""
+                    ).length
+                  : 0;
+                return (
+                  <div className="faint" style={{ fontSize: 12.5 }}>
+                    Using channel: <strong style={{ color: "var(--fg)" }}>{sel?.name ?? "—"}</strong> · {n}{" "}
+                    override{n === 1 ? "" : "s"}
+                  </div>
+                );
+              })()
+            )}
+
+            <div>
+              <label className="label">Library reuse</label>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  type="button"
+                  className={reuseMode === "auto" ? "btn btn-sm" : "btn-secondary btn-sm"}
+                  onClick={() => {
+                    setReuseMode("auto");
+                    setMatches(null);
+                    setReuseMap({});
+                  }}
+                >
+                  Auto
+                </button>
+                <button
+                  type="button"
+                  className={reuseMode === "manual" ? "btn btn-sm" : "btn-secondary btn-sm"}
+                  onClick={() => setReuseMode("manual")}
+                >
+                  Manual
+                </button>
+              </div>
+              <div className="faint" style={{ fontSize: 12, marginTop: 5, lineHeight: 1.5 }}>
+                {reuseMode === "auto"
+                  ? "Reuses matching clips from your library; generates the rest."
+                  : "Preview scenes and pick which clips to reuse."}
+              </div>
+            </div>
+          </div>
+        </details>
       </div>
 
       {/* ─── Scene preview + library suggestions ─────────────────────────── */}
@@ -676,7 +878,7 @@ export default function NewRunPage() {
               }}
             >
               {reuseCount} clip{reuseCount === 1 ? "" : "s"} marked for reuse. Click{" "}
-              <strong>Run pipeline</strong> above — those scenes skip generation and download from Drive.
+              <strong>Run</strong> above — those scenes skip generation and download from Drive.
             </div>
           )}
         </div>
@@ -684,21 +886,14 @@ export default function NewRunPage() {
 
       {/* ─── Time estimate ───────────────────────────────────────────────── */}
       {timeEstimate && stats && scriptStats.words > 0 && (
-        <div className="card" style={{ marginTop: 16 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
-            <h2 style={{ margin: 0 }}>Estimated time</h2>
-            <span
-              style={{
-                color: "var(--accent-hover)",
-                fontSize: 20,
-                fontWeight: 700,
-                letterSpacing: "-0.02em",
-              }}
-            >
+        <details className="card" style={{ marginTop: 16 }}>
+          <summary style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontWeight: 650, fontSize: 14 }}>Estimated time</span>
+            <span style={{ color: "var(--accent-hover)", fontSize: 15, fontWeight: 700 }}>
               ~{timeEstimate.total < 1 ? "<1" : Math.round(timeEstimate.total)} min
             </span>
-          </div>
-          <div style={{ color: "var(--fg-muted)", fontSize: 13, lineHeight: 1.8 }}>
+          </summary>
+          <div style={{ color: "var(--fg-muted)", fontSize: 13, lineHeight: 1.8, marginTop: 12 }}>
             <div>
               <strong style={{ color: "var(--fg)" }}>Parallel generation</strong>
               {stats.animationEnabled ? ` (TTS + ${timeEstimate.animScenes} video clips)` : " (TTS)"}: ~
@@ -742,38 +937,28 @@ export default function NewRunPage() {
           <div className="faint" style={{ fontSize: 11, marginTop: 9 }}>
             Rough numbers — real runs are usually 10–30% faster.
           </div>
-        </div>
+        </details>
       )}
 
-      {/* ─── How it works ───────────────────────────────────────────────── */}
-      <div className="card" style={{ marginTop: 16 }}>
-        <h2 style={{ marginBottom: 8 }}>What happens next</h2>
-        <ol style={{ paddingLeft: 20, lineHeight: 1.75, margin: 0, color: "var(--fg-muted)", fontSize: 13.5 }}>
+      {/* ─── How it works (collapsed — not needed on every visit) ────────── */}
+      <details style={{ marginTop: 16 }}>
+        <summary style={{ cursor: "pointer", fontSize: 12.5, color: "var(--fg-muted)" }}>
+          What happens when I run this?
+        </summary>
+        <ol style={{ paddingLeft: 20, lineHeight: 1.7, margin: "10px 0 0", color: "var(--fg-muted)", fontSize: 13 }}>
           <li>Gemini splits the script into scenes, each with a visual prompt.</li>
-          <li>Per scene, MiniMax TTS narration and a Grok video clip generate in parallel.</li>
-          <li>FFmpeg stitches all clips together with crossfade transitions.</li>
+          <li>ElevenLabs narrates the whole script; a {stats?.videoModelLabel ?? "Veo 3.1"} clip is generated per scene.</li>
+          <li>FFmpeg stitches the clips with crossfades; live logs stream to the run page.</li>
           <li>If Drive sync is on, the finished run uploads automatically.</li>
         </ol>
-        <p className="faint" style={{ fontSize: 12.5, marginTop: 10, marginBottom: 0 }}>
-          Live logs for every stage stream into the run page in real time.
-        </p>
-      </div>
+      </details>
 
-      {script.trim() !== "" && (
-        <div className="run-bar">
-          <div style={{ fontSize: 13, color: "var(--fg-muted)" }}>
-            <strong style={{ color: "var(--fg)" }}>{scriptStats.words}</strong> words · ≈{" "}
-            <strong style={{ color: "var(--accent-hover)" }}>{scriptStats.duration}</strong> final
-          </div>
-          <button className="btn" onClick={start} disabled={busy || !script.trim()}>
-            {busy
-              ? "Starting…"
-              : reuseCount > 0
-                ? `Run pipeline · reusing ${reuseCount} clip${reuseCount === 1 ? "" : "s"}`
-                : "Run pipeline"}
-          </button>
-        </div>
-      )}
+      <VoiceLibraryModal
+        open={voiceModalOpen}
+        onClose={() => setVoiceModalOpen(false)}
+        onSelect={onSelectVoice}
+        selectedVoiceId={settings.TTS_VOICE_ID ?? null}
+      />
     </div>
   );
 }

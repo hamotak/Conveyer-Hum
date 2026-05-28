@@ -1,102 +1,120 @@
 "use client";
 import { useEffect, useState } from "react";
 import { usePersistedState } from "../_use-persisted-state";
+import { ChannelFields, type ChannelFieldsValue } from "../_channel-fields";
+import { VoiceLibraryModal, type VoiceOption } from "../_voice-library-modal";
+import { loadStylePreset, DEFAULT_STYLE_PRESET_ID } from "@/lib/style-presets";
 
 interface PromptPreset {
   id: number;
   name: string;
-  content: string;
   description: string | null;
-  animation_motion: string | null;
-  image_prompt: string | null;
+  style_preset_id: string | null;
+  video_style: string | null;
+  video_model: string | null;
+  aspect_ratio: string | null;
+  voice_speed: number | null;
+  voice_stability: number | null;
+  voice_similarity_boost: number | null;
+  voice_style: number | null;
   voice_id: string | null;
-  created_at: string;
+  voice_provider: string | null;
   updated_at: string;
 }
 
-const META: { name: string; label: string; help: string; rows: number }[] = [
-  {
-    name: "scene_split",
-    label: "Scene Split — system prompt for Gemini",
-    help:
-      "The DEFAULT prompt for slicing a script into scenes. Used when a run has no channel selected. " +
-      "Channel profiles above each carry their own scene_split prompt that overrides this. See docs/PROMPT-GUIDE.md.",
-    rows: 16,
-  },
-  {
-    name: "animation_motion",
-    label: "Animation Motion — default motion style for Grok",
-    help:
-      "Appended to every scene's visual_prompt before being sent to Grok. Used when a run's channel " +
-      "doesn't set its own Animation Motion override.",
-    rows: 4,
-  },
-  {
-    name: "image_prompt",
-    label: "Image Style — (unused — video-only mode)",
-    help: "Not used in Conveyer Hum (video-only, no image stage). Kept for a possible future image mode.",
-    rows: 3,
-  },
-];
-
 const labelStyle: React.CSSProperties = { marginTop: 6 };
 
-function optionalNote(text: string) {
-  return <span className="faint" style={{ fontWeight: 400, fontSize: 12 }}>{text}</span>;
+/** A fresh ChannelFieldsValue pre-filled from a style preset's defaults. */
+function cfFromPreset(id: string): ChannelFieldsValue {
+  const p = loadStylePreset(id);
+  return {
+    stylePresetId: p.id,
+    videoStyle: p.defaults.videoStyle,
+    videoModel: "veo-video",
+    aspectRatio: "16:9",
+    voiceSpeed: String(p.defaults.ttsSpeed),
+    voiceStability: String(p.defaults.ttsStability),
+    voiceSimilarity: String(p.defaults.ttsSimilarityBoost),
+    voiceStyle: String(p.defaults.ttsStyle),
+  };
+}
+
+function cfPayload(cf: ChannelFieldsValue) {
+  const numOrNull = (s: string) => (s.trim() === "" ? null : Number(s));
+  return {
+    style_preset_id: cf.stylePresetId,
+    video_style: cf.videoStyle.trim() || null,
+    video_model: cf.videoModel.trim() || null,
+    aspect_ratio: cf.aspectRatio.trim() || null,
+    voice_speed: numOrNull(cf.voiceSpeed),
+    voice_stability: numOrNull(cf.voiceStability),
+    voice_similarity_boost: numOrNull(cf.voiceSimilarity),
+    voice_style: numOrNull(cf.voiceStyle),
+  };
 }
 
 export default function PromptsPage() {
-  const [values, setValues] = useState<Record<string, string>>({});
-  const [saved, setSaved] = useState(false);
-
   const [presets, setPresets] = useState<PromptPreset[]>([]);
   const [presetError, setPresetError] = useState<string | null>(null);
 
-  // "Add new channel" form — persisted across navigation so a half-written
-  // channel prompt survives a tab switch. Cleared on successful create.
+  // Add form
   const [newName, setNewName] = usePersistedState("channels.new.name", "");
   const [newDescription, setNewDescription] = usePersistedState("channels.new.description", "");
-  const [newVoiceId, setNewVoiceId] = usePersistedState("channels.new.voiceId", "");
-  const [newContent, setNewContent] = usePersistedState("channels.new.content", "");
-  const [newAnimationMotion, setNewAnimationMotion] = usePersistedState(
-    "channels.new.animationMotion",
-    ""
+  const [newCF, setNewCF] = usePersistedState<ChannelFieldsValue>(
+    "channels.new.cf",
+    cfFromPreset(DEFAULT_STYLE_PRESET_ID)
   );
+  const [newVoiceId, setNewVoiceId] = usePersistedState("channels.new.voiceId", "");
+  const [newVoiceProvider, setNewVoiceProvider] = usePersistedState("channels.new.voiceProvider", "");
+  const [newVoiceLabel, setNewVoiceLabel] = usePersistedState("channels.new.voiceLabel", "");
 
+  // Edit form
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editName, setEditName] = useState("");
   const [editDescription, setEditDescription] = useState("");
+  const [editCF, setEditCF] = useState<ChannelFieldsValue>(cfFromPreset(DEFAULT_STYLE_PRESET_ID));
   const [editVoiceId, setEditVoiceId] = useState("");
-  const [editContent, setEditContent] = useState("");
-  const [editAnimationMotion, setEditAnimationMotion] = useState("");
+  const [editVoiceProvider, setEditVoiceProvider] = useState("");
+  const [editVoiceLabel, setEditVoiceLabel] = useState("");
 
-  async function load() {
-    const r = await fetch("/api/prompts");
-    setValues(await r.json());
-  }
+  // Voice picker (shared modal)
+  const [voiceModalOpen, setVoiceModalOpen] = useState(false);
+  const [voiceTarget, setVoiceTarget] = useState<"new" | "edit">("new");
+  const [voiceMap, setVoiceMap] = useState<Record<string, string>>({});
+
   async function loadPresets() {
     const r = await fetch("/api/prompt-presets");
     setPresets(await r.json());
+    try {
+      const v = (await (await fetch("/api/voices")).json()) as { voices: VoiceOption[] };
+      const map: Record<string, string> = {};
+      for (const o of v.voices ?? []) map[o.voiceId] = o.name;
+      setVoiceMap(map);
+    } catch {
+      /* labels fall back to the id */
+    }
   }
   useEffect(() => {
-    load();
     loadPresets();
   }, []);
 
-  async function save() {
-    await fetch("/api/prompts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(values),
-    });
-    setSaved(true);
-    setTimeout(() => setSaved(false), 1500);
+  function onSelectVoice(v: VoiceOption) {
+    if (voiceTarget === "new") {
+      setNewVoiceId(v.voiceId);
+      setNewVoiceProvider(v.provider);
+      setNewVoiceLabel(v.name);
+    } else {
+      setEditVoiceId(v.voiceId);
+      setEditVoiceProvider(v.provider);
+      setEditVoiceLabel(v.name);
+    }
+    setVoiceModalOpen(false);
   }
 
   async function createPreset() {
     setPresetError(null);
-    if (!newName.trim() || !newContent.trim()) {
-      setPresetError("Channel name and Scene Split prompt are both required");
+    if (!newName.trim()) {
+      setPresetError("Channel name is required");
       return;
     }
     const r = await fetch("/api/prompt-presets", {
@@ -104,10 +122,10 @@ export default function PromptsPage() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         name: newName,
-        content: newContent,
         description: newDescription.trim() || null,
         voice_id: newVoiceId.trim() || null,
-        animation_motion: newAnimationMotion.trim() || null,
+        voice_provider: newVoiceProvider.trim() || null,
+        ...cfPayload(newCF),
       }),
     });
     if (!r.ok) {
@@ -117,9 +135,10 @@ export default function PromptsPage() {
     }
     setNewName("");
     setNewDescription("");
+    setNewCF(cfFromPreset(DEFAULT_STYLE_PRESET_ID));
     setNewVoiceId("");
-    setNewContent("");
-    setNewAnimationMotion("");
+    setNewVoiceProvider("");
+    setNewVoiceLabel("");
     await loadPresets();
   }
 
@@ -127,19 +146,25 @@ export default function PromptsPage() {
     setEditingId(p.id);
     setEditName(p.name);
     setEditDescription(p.description ?? "");
+    const presetId = p.style_preset_id ?? DEFAULT_STYLE_PRESET_ID;
+    setEditCF({
+      stylePresetId: presetId,
+      videoStyle: p.video_style ?? "",
+      videoModel: p.video_model ?? "veo-video",
+      aspectRatio: p.aspect_ratio ?? "16:9",
+      voiceSpeed: p.voice_speed == null ? "" : String(p.voice_speed),
+      voiceStability: p.voice_stability == null ? "" : String(p.voice_stability),
+      voiceSimilarity: p.voice_similarity_boost == null ? "" : String(p.voice_similarity_boost),
+      voiceStyle: p.voice_style == null ? "" : String(p.voice_style),
+    });
     setEditVoiceId(p.voice_id ?? "");
-    setEditContent(p.content);
-    setEditAnimationMotion(p.animation_motion ?? "");
+    setEditVoiceProvider(p.voice_provider ?? "");
+    setEditVoiceLabel(p.voice_id ? voiceMap[p.voice_id] ?? p.voice_id : "");
     setPresetError(null);
   }
 
   function cancelEdit() {
     setEditingId(null);
-    setEditName("");
-    setEditDescription("");
-    setEditVoiceId("");
-    setEditContent("");
-    setEditAnimationMotion("");
   }
 
   async function saveEdit() {
@@ -150,10 +175,10 @@ export default function PromptsPage() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         name: editName,
-        content: editContent,
         description: editDescription.trim() || null,
         voice_id: editVoiceId.trim() || null,
-        animation_motion: editAnimationMotion.trim() || null,
+        voice_provider: editVoiceProvider.trim() || null,
+        ...cfPayload(editCF),
       }),
     });
     if (!r.ok) {
@@ -174,24 +199,18 @@ export default function PromptsPage() {
 
   return (
     <div>
-      <h1>Channels &amp; Prompts</h1>
-      <p className="muted" style={{ marginBottom: 20, fontSize: 14, lineHeight: 1.6 }}>
-        A <strong style={{ color: "var(--fg)" }}>channel profile</strong> bundles everything specific
-        to one YouTube channel — its scene-split prompt, MiniMax voice, motion style. Pick a channel on
-        the New Run page and all of it applies in one click. The Default prompts at the bottom are used
-        only when no channel is selected.
+      <h1>Channels</h1>
+      <p className="muted" style={{ marginBottom: 20, fontSize: 13.5 }}>
+        Each channel bundles a prompt, voice and look — pick it in one click on a new run.
       </p>
 
-      {/* ─── Channels ───────────────────────────────────────────────────── */}
       <div className="card" style={{ marginBottom: 24 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
           <h2 style={{ margin: 0 }}>Channels</h2>
           <span className="badge badge-neutral">{presets.length}</span>
         </div>
         <p className="muted" style={{ fontSize: 12.5, marginBottom: 16, lineHeight: 1.55 }}>
-          One profile per channel. Required: name + Scene Split prompt. Optional: a MiniMax voice
-          (overrides the global voice), an Animation Motion override, and a description. Empty optional
-          fields fall back to global defaults.
+          Pick a style preset; fine-tune voice and video only if you need to.
         </p>
 
         {presetError && (
@@ -217,11 +236,7 @@ export default function PromptsPage() {
         )}
 
         {presets.map((p) => (
-          <div
-            key={p.id}
-            className="card-inset"
-            style={{ padding: 14, marginBottom: 10 }}
-          >
+          <div key={p.id} className="card-inset" style={{ padding: 14, marginBottom: 10 }}>
             {editingId === p.id ? (
               <>
                 <label className="label" style={labelStyle}>
@@ -234,54 +249,26 @@ export default function PromptsPage() {
                   placeholder="Channel name"
                   style={{ marginBottom: 10 }}
                 />
-                <label className="label" style={labelStyle}>
-                  Description {optionalNote("(optional note — for your reference)")}
-                </label>
+                <label className="label" style={labelStyle}>Description</label>
                 <input
                   className="input"
                   value={editDescription}
                   onChange={(e) => setEditDescription(e.target.value)}
-                  placeholder="e.g. Longevity / Blue Zone documentary, audience 50-75"
-                  style={{ marginBottom: 10 }}
+                  placeholder="e.g. Calm sleep stories, 30-min episodes"
+                  style={{ marginBottom: 14 }}
                 />
-                <label className="label" style={labelStyle}>
-                  MiniMax voice {optionalNote("(optional — empty uses the global TTS_VOICE_ID)")}
-                </label>
-                <input
-                  className="input"
-                  value={editVoiceId}
-                  onChange={(e) => setEditVoiceId(e.target.value)}
-                  placeholder="e.g. English_Comedian"
-                  style={{ marginBottom: 10 }}
+                <ChannelFields
+                  value={editCF}
+                  onChange={(patch) => setEditCF((c) => ({ ...c, ...patch }))}
+                  voiceLabel={editVoiceLabel || null}
+                  onOpenVoicePicker={() => {
+                    setVoiceTarget("edit");
+                    setVoiceModalOpen(true);
+                  }}
                 />
-                <label className="label" style={labelStyle}>
-                  Scene Split prompt <span style={{ color: "var(--danger)" }}>*</span>
-                </label>
-                <textarea
-                  className="textarea"
-                  rows={12}
-                  value={editContent}
-                  onChange={(e) => setEditContent(e.target.value)}
-                  style={{ marginBottom: 10 }}
-                />
-                <label className="label" style={labelStyle}>
-                  Animation Motion override {optionalNote("(optional — empty uses the global default)")}
-                </label>
-                <textarea
-                  className="textarea"
-                  rows={4}
-                  value={editAnimationMotion}
-                  onChange={(e) => setEditAnimationMotion(e.target.value)}
-                  placeholder="Leave empty to inherit the default Animation Motion prompt."
-                  style={{ marginBottom: 12 }}
-                />
-                <div style={{ display: "flex", gap: 8 }}>
-                  <button className="btn" onClick={saveEdit}>
-                    Save
-                  </button>
-                  <button className="btn-secondary" onClick={cancelEdit}>
-                    Cancel
-                  </button>
+                <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+                  <button className="btn" onClick={saveEdit}>Save</button>
+                  <button className="btn-secondary" onClick={cancelEdit}>Cancel</button>
                   <button className="btn-danger" onClick={() => deletePreset(p.id)} style={{ marginLeft: "auto" }}>
                     Delete
                   </button>
@@ -291,147 +278,65 @@ export default function PromptsPage() {
               <>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                   <div style={{ fontWeight: 650, fontSize: 14.5 }}>{p.name}</div>
+                  <span className="badge badge-accent">{loadStylePreset(p.style_preset_id).label}</span>
                   {p.voice_id && (
-                    <span className="badge badge-success" title={`Custom MiniMax voice: ${p.voice_id}`}>
-                      voice
-                    </span>
-                  )}
-                  {p.animation_motion && (
-                    <span className="badge badge-accent" title="Custom Animation Motion override">
-                      motion
-                    </span>
+                    <span className="badge badge-success" title={voiceMap[p.voice_id] ?? p.voice_id}>Voice</span>
                   )}
                   <div className="faint" style={{ fontSize: 11.5, marginLeft: "auto" }}>
                     {new Date(p.updated_at).toLocaleDateString()}
                   </div>
-                  <button className="btn-secondary btn-sm" onClick={() => startEdit(p)}>
-                    Edit
-                  </button>
+                  <button className="btn-secondary btn-sm" onClick={() => startEdit(p)}>Edit</button>
                 </div>
                 {p.description && (
-                  <div style={{ color: "var(--fg-muted)", fontSize: 12.5, marginTop: 6 }}>
-                    {p.description}
-                  </div>
+                  <div style={{ color: "var(--fg-muted)", fontSize: 12.5, marginTop: 6 }}>{p.description}</div>
                 )}
-                <div className="faint" style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
-                  {p.content.slice(0, 150)}
-                  {p.content.length > 150 ? "…" : ""}
-                </div>
               </>
             )}
           </div>
         ))}
 
-        {/* New channel form */}
+        {/* Add new channel */}
         <div style={{ borderTop: "1px solid var(--border)", paddingTop: 16, marginTop: 16 }}>
-          <h3 style={{ marginBottom: 10 }}>Add new channel</h3>
-
+          <h3 style={{ marginBottom: 12 }}>Add new channel</h3>
           <label className="label" style={labelStyle}>
             Channel name <span style={{ color: "var(--danger)" }}>*</span>
           </label>
           <input
             className="input"
-            placeholder="e.g. The Blue Zone Way"
+            placeholder="e.g. Midnight Sleep Stories"
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
             style={{ marginBottom: 10 }}
           />
-
-          <label className="label" style={labelStyle}>
-            Description {optionalNote("(optional note — for your reference)")}
-          </label>
+          <label className="label" style={labelStyle}>Description</label>
           <input
             className="input"
-            placeholder="e.g. Longevity / Blue Zone documentary, audience 50-75"
+            placeholder="e.g. Calm sleep stories, 30-min episodes"
             value={newDescription}
             onChange={(e) => setNewDescription(e.target.value)}
-            style={{ marginBottom: 10 }}
-          />
-
-          <label className="label" style={labelStyle}>
-            MiniMax voice {optionalNote("(optional — empty uses the global TTS_VOICE_ID setting)")}
-          </label>
-          <input
-            className="input"
-            placeholder="e.g. English_Comedian"
-            value={newVoiceId}
-            onChange={(e) => setNewVoiceId(e.target.value)}
-            style={{ marginBottom: 10 }}
-          />
-
-          <label className="label" style={labelStyle}>
-            Scene Split prompt <span style={{ color: "var(--danger)" }}>*</span>
-          </label>
-          <textarea
-            className="textarea"
-            rows={9}
-            placeholder="Paste this channel's scene_split system prompt. See docs/PROMPT-GUIDE.md."
-            value={newContent}
-            onChange={(e) => setNewContent(e.target.value)}
-            style={{ marginBottom: 8 }}
-          />
-          <button
-            className="btn-ghost btn-sm"
-            onClick={() => setNewContent(values.scene_split ?? "")}
-            title="Copy the current default scene_split as a starting point"
-            style={{ marginBottom: 12 }}
-          >
-            ↓ Copy scene_split from default
-          </button>
-
-          <label className="label" style={labelStyle}>
-            Animation Motion override {optionalNote("(optional — empty uses the global default)")}
-          </label>
-          <textarea
-            className="textarea"
-            rows={3}
-            placeholder="Leave empty to inherit the default. Fill in for a per-channel motion style."
-            value={newAnimationMotion}
-            onChange={(e) => setNewAnimationMotion(e.target.value)}
-            style={{ marginBottom: 8 }}
-          />
-          <button
-            className="btn-ghost btn-sm"
-            onClick={() => setNewAnimationMotion(values.animation_motion ?? "")}
-            title="Copy the current default Animation Motion as a starting point"
             style={{ marginBottom: 14 }}
-          >
-            ↓ Copy motion from default
-          </button>
-
-          <div>
-            <button className="btn" onClick={createPreset}>
-              Add channel
-            </button>
+          />
+          <ChannelFields
+            value={newCF}
+            onChange={(patch) => setNewCF((c) => ({ ...c, ...patch }))}
+            voiceLabel={newVoiceLabel || null}
+            onOpenVoicePicker={() => {
+              setVoiceTarget("new");
+              setVoiceModalOpen(true);
+            }}
+          />
+          <div style={{ marginTop: 14 }}>
+            <button className="btn" onClick={createPreset}>Add channel</button>
           </div>
         </div>
       </div>
 
-      {/* ─── Default prompts ────────────────────────────────────────────── */}
-      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
-        <h2 style={{ margin: 0 }}>Default prompts</h2>
-        <button className="btn btn-sm" onClick={save}>
-          {saved ? "Saved ✓" : "Save all prompts"}
-        </button>
-      </div>
-      <p className="muted" style={{ fontSize: 12.5, marginBottom: 14, lineHeight: 1.5 }}>
-        Used when a run has no channel selected, or when a channel leaves a field empty. Changes take
-        effect on the next run — no restart needed.
-      </p>
-      {META.map((m) => (
-        <div key={m.name} className="card" style={{ marginBottom: 14 }}>
-          <h3 style={{ marginBottom: 4 }}>{m.label}</h3>
-          <p className="muted" style={{ fontSize: 12.5, marginBottom: 10, lineHeight: 1.5 }}>
-            {m.help}
-          </p>
-          <textarea
-            className="textarea"
-            rows={m.rows}
-            value={values[m.name] ?? ""}
-            onChange={(e) => setValues({ ...values, [m.name]: e.target.value })}
-          />
-        </div>
-      ))}
+      <VoiceLibraryModal
+        open={voiceModalOpen}
+        onClose={() => setVoiceModalOpen(false)}
+        onSelect={onSelectVoice}
+        selectedVoiceId={voiceTarget === "new" ? newVoiceId || null : editVoiceId || null}
+      />
     </div>
   );
 }

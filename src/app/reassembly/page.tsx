@@ -9,7 +9,7 @@ import { usePersistedState } from "../_use-persisted-state";
  * Script → AI splits it into scenes → AI matches each scene to a clip in the
  * Google Drive library → the user reviews and swaps any pick (or browses the
  * whole library) → unmatched scenes are generated fresh with Grok → every
- * scene is narrated with MiniMax → assembled into one MP4.
+ * scene is narrated with ElevenLabs → assembled into one MP4.
  *
  * This is all the existing pipeline already does: it just POSTs /api/runs with
  * a manual reuseMap (scene index → Drive file id) and autoReuse off.
@@ -133,6 +133,9 @@ export default function ReassemblyPage() {
   const [building, setBuilding] = useState(false);
   const [buildError, setBuildError] = useState<string | null>(null);
 
+  // Friendly name of the active video model (e.g. "Veo 3.1" / "Grok").
+  const [videoLabel, setVideoLabel] = useState("Veo 3.1");
+
   useEffect(() => {
     fetch("/api/prompt-presets")
       .then((r) => r.json())
@@ -142,6 +145,12 @@ export default function ReassemblyPage() {
       .then((r) => r.json())
       .then((s: { connected?: boolean }) => setDriveConnected(Boolean(s.connected)))
       .catch(() => setDriveConnected(null));
+    fetch("/api/stats")
+      .then((r) => r.json())
+      .then((s: { videoModelLabel?: string }) => {
+        if (s.videoModelLabel) setVideoLabel(s.videoModelLabel);
+      })
+      .catch(() => {});
   }, []);
 
   const matchesByScene = useMemo(() => {
@@ -353,10 +362,9 @@ export default function ReassemblyPage() {
   return (
     <div>
       <h1>Re-assembly</h1>
-      <p className="muted" style={{ marginBottom: 20, fontSize: 14, lineHeight: 1.6 }}>
-        Build a video mostly from clips you already have. AI matches each script scene to a
-        clip in your Google Drive library; you swap any pick by hand, and only the missing
-        scenes are generated fresh with Grok. Every scene is narrated with MiniMax.
+      <p className="muted" style={{ marginBottom: 20, fontSize: 13.5 }}>
+        Reuse clips you already have — AI matches each scene to your library, you swap picks,
+        and only the gaps generate fresh. <span className="faint">Script → Analyze → Review → Build.</span>
       </p>
 
       {driveConnected === false && (
@@ -488,7 +496,7 @@ export default function ReassemblyPage() {
                     marginBottom: 6,
                   }}
                 >
-                  <span style={{ fontWeight: 650, fontSize: 13 }}>Scene {scene.index}</span>
+                  <span style={{ fontWeight: 650, fontSize: 13 }}>Scene {scene.index + 1}</span>
                   {assignedId ? (
                     <span className="badge badge-success">Reusing a clip</span>
                   ) : (
@@ -538,7 +546,7 @@ export default function ReassemblyPage() {
                   </div>
                 ) : (
                   <div className="faint" style={{ fontSize: 12 }}>
-                    A fresh ~6-second clip will be generated with Grok.
+                    A fresh clip will be generated with {videoLabel}.
                   </div>
                 )}
 
@@ -713,8 +721,8 @@ export default function ReassemblyPage() {
                 {reuseCount} reused · {freshCount} generated fresh
               </div>
               <div className="faint" style={{ fontSize: 12, marginTop: 2 }}>
-                Reusing {reuseCount} clip{reuseCount === 1 ? "" : "s"} skips that many Grok
-                generations. The {freshCount} fresh scene{freshCount === 1 ? "" : "s"} and all
+                Reusing {reuseCount} clip{reuseCount === 1 ? "" : "s"} skips that many {videoLabel}
+                {" "}generations. The {freshCount} fresh scene{freshCount === 1 ? "" : "s"} and all
                 voiceovers are still generated.
               </div>
             </div>

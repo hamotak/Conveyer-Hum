@@ -2,9 +2,18 @@ import "./globals.css";
 import type { ReactNode } from "react";
 import { Sidebar } from "./_sidebar";
 
+/*
+ * Benign dev-only console output (NOT app bugs — safe to ignore in `npm run dev`):
+ *   - "Download the React DevTools…"      → React's dev suggestion
+ *   - "[HMR] connected" / "[Fast Refresh]" → Next.js hot-reload logs
+ *   - the Next.js dev-overlay "N" badge count tallies HMR/compile events, not runtime errors
+ * The runtime console is otherwise clean. `app/icon.svg` provides the favicon
+ * so there's no more /favicon.ico 404. None of the above appears in production.
+ */
+
 export const metadata = {
   title: "Conveyer Hum",
-  description: "Local pipeline platform for faceless AI YouTube videos — Grok video + MiniMax voice.",
+  description: "Local pipeline platform for faceless AI YouTube videos — Veo 3.1 video + ElevenLabs voice.",
 };
 
 // Applied before first paint so the chosen theme doesn't flash (anti-FOUC).

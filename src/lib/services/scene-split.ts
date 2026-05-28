@@ -11,6 +11,12 @@ export interface Scene {
   text: string;
   visual_prompt: string;
   duration_hint_sec: number;
+  /** Visual continuity (optional, added 2026-05-28). All three are emitted by
+   *  the LLM when the scene-split prompt asks for them; older scenes.json files
+   *  lack them and the planner falls back to "fresh shot per scene". */
+  continuity_group_id?: string | null;
+  continuity_break?: boolean;
+  continuity_hint?: string | null;
 }
 
 /**
@@ -209,12 +215,19 @@ async function processChunk(
     throw new Error("scene_split: model did not return a JSON array");
   }
 
-  return json.map((s, i) => ({
-    index: sceneIndexOffset + i,
-    text: String(s.text ?? ""),
-    visual_prompt: String(s.visual_prompt ?? ""),
-    duration_hint_sec: Number(s.duration_hint_sec ?? 6),
-  }));
+  return json.map((s, i) => {
+    const groupId = typeof s.continuity_group_id === "string" && s.continuity_group_id.trim() ? s.continuity_group_id.trim() : null;
+    const hint = typeof s.continuity_hint === "string" && s.continuity_hint.trim() ? s.continuity_hint.trim() : null;
+    return {
+      index: sceneIndexOffset + i,
+      text: String(s.text ?? ""),
+      visual_prompt: String(s.visual_prompt ?? ""),
+      duration_hint_sec: Number(s.duration_hint_sec ?? 6),
+      continuity_group_id: groupId,
+      continuity_break: s.continuity_break === true,
+      continuity_hint: hint,
+    } as Scene;
+  });
 }
 
 /**
@@ -257,44 +270,132 @@ function chunkScript(script: string, targetWords: number): string[] {
 }
 
 /**
- * HARD GUARD against over-long scenes.
+ * Scene-length normalization (pacing rewrite — Prompt 6).
  *
- * Grok via 69labs returns a fixed ~6-second clip. If a scene's narration is
- * longer than the clip, the video freezes on the last frame for the overflow.
- * The scene_split prompt tells the LLM to keep scenes short, but the LLM does
- * not always obey — so we enforce it in code here, no matter what the LLM did.
+ * Target is 6–8s scenes cut by idea. The LLM does most of this, but we enforce
+ * the hard bounds in code so output is predictable no matter what the model did.
+ * Splitting/merging only ever moves whole words, so the joined text stays
+ * byte-identical and script coverage remains 100%.
  *
- * Any scene whose text exceeds MAX_SCENE_WORDS is split into the fewest equal
- * word-boundary chunks that all fit. Splitting only on word boundaries keeps
- * the joined text identical, so script coverage stays 100%. The split halves
- * share the original scene's visual_prompt (same visual world).
+ *  - Over-long scenes (> MAX_SCENE_WORDS, ~8s) are split into the fewest pieces
+ *    that all fit, preferring a clause boundary (em-dash, semicolon, colon,
+ *    comma) near each cut and falling back to an even word split.
+ *  - Under-length scenes (< MIN_SCENE_WORDS, ~4s) are merged with a neighbor —
+ *    forward (into the next scene) first, then backward — so a stray fragment
+ *    is never its own scene. A merge is skipped only if it would exceed the max.
  *
- * MAX_SCENE_WORDS is deliberately conservative (~5.5s even on a slow ~108wpm
- * MiniMax voice) so the clip always covers the audio with motion to spare.
+ * Word↔second mapping assumes the calm narration pace (~150 raw wpm × 0.85).
  */
-const MAX_SCENE_WORDS = 11;
+// Pacing bounds (Prompt 9 — faster chunking + hook acceleration).
+// Body: 4–6s scenes (~10–14 words); the first ~150 words (the hook) go faster
+// at 3–5s (~8–12 words). Bounds are chosen by each scene's cumulative position.
+const MAX_WORDS = 15; // ~6s body hard max
+const MIN_WORDS = 8; // ~3.2s body minimum
+const HOOK_MAX_WORDS = 12; // ~4.8s hook max
+const HOOK_MIN_WORDS = 6; // ~2.4s hook minimum
+const HOOK_WORD_WINDOW = 150; // first ~150 words use the hook bounds
+const CLAUSE_END = /[—;:,]$/; // a word that ends a clause
+
+const wordCount = (t: string) => t.trim().split(/\s+/).filter(Boolean).length;
+const hintSec = (words: number) => Math.min(8, Math.max(3, Math.round((words / 150) * 60)));
+const boundsAt = (cumWords: number) =>
+  cumWords < HOOK_WORD_WINDOW
+    ? { max: HOOK_MAX_WORDS, min: HOOK_MIN_WORDS }
+    : { max: MAX_WORDS, min: MIN_WORDS };
+
+/** Split one over-long scene into ≤maxWords pieces, preferring clause cuts. */
+function splitLongScene(s: Scene, maxWords: number): Scene[] {
+  const words = s.text.trim().split(/\s+/).filter(Boolean);
+  if (words.length <= maxWords) return [s];
+
+  const pieceCount = Math.ceil(words.length / maxWords);
+  const targetLen = Math.ceil(words.length / pieceCount);
+  const pieces: string[][] = [];
+  let start = 0;
+
+  for (let p = 0; p < pieceCount - 1; p++) {
+    const ideal = start + targetLen;
+    let cut = ideal;
+    // Look for a clause boundary within ±4 words of the ideal cut; nearest wins.
+    let best = -1;
+    const lo = Math.max(start + 1, ideal - 4);
+    const hi = Math.min(words.length - 1, ideal + 4);
+    for (let i = lo; i <= hi; i++) {
+      if (CLAUSE_END.test(words[i - 1]) && (best === -1 || Math.abs(i - ideal) < Math.abs(best - ideal))) {
+        best = i;
+      }
+    }
+    if (best !== -1) cut = best;
+    // Leave at least one word for each remaining piece.
+    cut = Math.max(start + 1, Math.min(cut, words.length - (pieceCount - 1 - p)));
+    pieces.push(words.slice(start, cut));
+    start = cut;
+  }
+  pieces.push(words.slice(start));
+
+  // The pieces describe the SAME beat as the parent — only the first piece may
+  // legitimately break continuity (inheriting the parent's flag); subsequent
+  // pieces explicitly do NOT break (they're a forced sub-split of one shot).
+  return pieces.map((w, i) => ({
+    index: 0,
+    text: w.join(" "),
+    visual_prompt: s.visual_prompt,
+    duration_hint_sec: hintSec(w.length),
+    continuity_group_id: s.continuity_group_id ?? null,
+    continuity_break: i === 0 ? !!s.continuity_break : false,
+    continuity_hint: s.continuity_hint ?? null,
+  }));
+}
 
 function enforceMaxSceneLength(scenes: Scene[]): Scene[] {
-  const out: Scene[] = [];
+  // Pass 1 — split over-long scenes. Bounds depend on cumulative word position
+  // (the hook window gets a tighter max for snappier pacing).
+  const split: Scene[] = [];
+  let cumSplit = 0;
   for (const s of scenes) {
-    const words = s.text.trim().split(/\s+/).filter(Boolean);
-    if (words.length <= MAX_SCENE_WORDS) {
-      out.push(s);
-      continue;
-    }
-    const chunkCount = Math.ceil(words.length / MAX_SCENE_WORDS);
-    const perChunk = Math.ceil(words.length / chunkCount);
-    for (let i = 0; i < words.length; i += perChunk) {
-      const chunkWords = words.slice(i, i + perChunk);
-      out.push({
-        index: 0, // reindexed below
-        text: chunkWords.join(" "),
-        visual_prompt: s.visual_prompt,
-        duration_hint_sec: Math.min(6, Math.max(2, Math.round((chunkWords.length / 150) * 60))),
-      });
-    }
+    const { max } = boundsAt(cumSplit);
+    split.push(...splitLongScene(s, max));
+    cumSplit += wordCount(s.text);
   }
-  return out.map((s, i) => ({ ...s, index: i }));
+
+  // Pass 2 — merge under-length scenes (forward first, then backward).
+  const merged: Scene[] = [];
+  let i = 0;
+  let cumMerge = 0;
+  while (i < split.length) {
+    const { min, max } = boundsAt(cumMerge);
+    let cur: Scene = { ...split[i] };
+    let curWords = wordCount(cur.text);
+
+    // Merge forward while still too short and the next scene fits.
+    while (curWords < min && i + 1 < split.length) {
+      const nextWords = wordCount(split[i + 1].text);
+      if (curWords + nextWords > max) break;
+      cur = { ...cur, text: `${cur.text} ${split[i + 1].text}`.trim() };
+      curWords += nextWords;
+      i++;
+    }
+
+    // Still short and nothing to merge forward → fold backward into previous.
+    if (curWords < min && merged.length > 0) {
+      const prev = merged[merged.length - 1];
+      const prevWords = wordCount(prev.text);
+      if (prevWords + curWords <= max) {
+        prev.text = `${prev.text} ${cur.text}`.trim();
+        prev.duration_hint_sec = hintSec(prevWords + curWords);
+        cumMerge += curWords;
+        i++;
+        continue;
+      }
+    }
+
+    cur.duration_hint_sec = hintSec(curWords);
+    merged.push(cur);
+    cumMerge += curWords;
+    i++;
+  }
+
+  return merged.map((s, i) => ({ ...s, index: i }));
 }
 
 async function splitWithGemini(systemPrompt: string, script: string): Promise<string> {

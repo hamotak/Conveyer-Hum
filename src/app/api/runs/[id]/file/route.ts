@@ -4,6 +4,57 @@ import fs from "node:fs";
 import db from "@/lib/db";
 import { ensureInit } from "@/lib/init";
 import { getRunDir } from "@/lib/run-paths";
+import { ensureVideoPoster } from "@/lib/services/video-poster";
+
+/** Stream a file (or a byte range of it) as a Web ReadableStream — never buffers
+ *  the whole thing in memory, so 1 GB+ final.mp4 plays back fine. */
+function streamFile(target: string, start?: number, end?: number): ReadableStream<Uint8Array> {
+  let node: fs.ReadStream | null = null;
+  let closed = false;
+
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      node = fs.createReadStream(target, start !== undefined && end !== undefined ? { start, end } : {});
+      node.on("data", (chunk) => {
+        node?.pause();
+        if (closed) return;
+        try {
+          controller.enqueue(typeof chunk === "string" ? new TextEncoder().encode(chunk) : new Uint8Array(chunk));
+        } catch {
+          closed = true;
+          node?.destroy();
+          return;
+        }
+        if ((controller.desiredSize ?? 1) > 0) node?.resume();
+      });
+      node.once("end", () => {
+        if (closed) return;
+        closed = true;
+        try {
+          controller.close();
+        } catch {
+          // The client may have closed the connection after the final chunk.
+        }
+      });
+      node.once("error", (err) => {
+        if (closed) return;
+        closed = true;
+        try {
+          controller.error(err);
+        } catch {
+          // Ignore late stream errors after a client disconnect.
+        }
+      });
+    },
+    pull() {
+      if (!closed) node?.resume();
+    },
+    cancel() {
+      closed = true;
+      node?.destroy();
+    },
+  });
+}
 
 const getRun = db.prepare("SELECT id FROM runs WHERE id = ?");
 
@@ -26,9 +77,16 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
   const download = url.searchParams.get("download") === "1";
 
   const runDir = path.resolve(getRunDir(id));
-  const target = path.resolve(path.join(runDir, rel));
+  let target = path.resolve(path.join(runDir, rel));
   if (!target.startsWith(runDir + path.sep) && target !== runDir) {
     return NextResponse.json({ error: "path escape blocked" }, { status: 400 });
+  }
+  if (rel === "final-poster.jpg") {
+    const finalPath = path.join(runDir, "final.mp4");
+    if (!fs.existsSync(finalPath) || !fs.statSync(finalPath).isFile()) {
+      return NextResponse.json({ error: "final video not found" }, { status: 404 });
+    }
+    target = await ensureVideoPoster(finalPath, target);
   }
   if (!fs.existsSync(target) || !fs.statSync(target).isFile()) {
     return NextResponse.json({ error: "file not found", target }, { status: 404 });
@@ -67,14 +125,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
         });
       }
       const chunkSize = end - start + 1;
-      const buffer = Buffer.alloc(chunkSize);
-      const fd = fs.openSync(target, "r");
-      try {
-        fs.readSync(fd, buffer, 0, chunkSize, start);
-      } finally {
-        fs.closeSync(fd);
-      }
-      return new Response(new Uint8Array(buffer), {
+      return new Response(streamFile(target, start, end), {
         status: 206,
         headers: {
           ...baseHeaders,
@@ -85,9 +136,8 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
     }
   }
 
-  // === Full response ===
-  const buffer = fs.readFileSync(target);
-  return new Response(new Uint8Array(buffer), {
+  // === Full response — streamed, so a 1 GB final.mp4 never buffers in memory. ===
+  return new Response(streamFile(target), {
     headers: {
       ...baseHeaders,
       "Content-Length": String(size),

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { ensureInit } from "@/lib/init";
 import { getSetting } from "@/lib/settings";
 import { getKeyCount } from "@/lib/services/labs69";
+import { videoModelLabel } from "@/lib/video-model";
 
 /**
  * Returns runtime stats used by the UI for estimate widgets:
@@ -38,5 +39,6 @@ export async function GET() {
     xfadeChunks,
     animationEnabled: animationProvider !== "off",
     animationRatio,
+    videoModelLabel: videoModelLabel(getSetting("ANIMATION_MODEL")),
   });
 }

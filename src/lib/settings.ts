@@ -11,7 +11,7 @@ export { isSecretKey, isMaskedValue, MASK_CHAR } from "./secret-keys";
 export const SETTING_KEYS = [
   // ── Required API keys ─────────────────────────────────────────────
   "GOOGLE_API_KEY",          // Gemini — scene splitting
-  "LABS69_API_KEY",          // 69labs — Grok video + MiniMax voiceover
+  "LABS69_API_KEY",          // 69labs — Grok video + ElevenLabs voiceover
 
   // ── Optional / backup providers ───────────────────────────────────
   "ELEVENLABS_API_KEY",      // direct ElevenLabs (without 69labs)
@@ -29,12 +29,13 @@ export const SETTING_KEYS = [
   "SCENE_SPLIT_MODEL",       // e.g. gemini-flash-latest, claude-sonnet-4-6
 
   // ── Text-to-Speech ────────────────────────────────────────────────
-  "TTS_PROVIDER",            // minimax (default) | 69labs | elevenlabs | openai
-  "TTS_VOICE_PROVIDER",      // For 69labs: edgetts | elevenlabs | voice-clone
-  "TTS_VOICE_ID",            // Voice id — MiniMax catalog/clone id, or ElevenLabs/Edge id
-  "TTS_MODEL",               // MiniMax: speech-02-hd · ElevenLabs: eleven_multilingual_v2
+  "STYLE_PRESET_ID",         // style preset for the no-channel run (Prompt 9): sleep-calm | standard-neutral
+  "TTS_PROVIDER",            // 69labs (default) | elevenlabs | openai | minimax (legacy)
+  "TTS_VOICE_PROVIDER",      // For 69labs: elevenlabs | edgetts | voice-clone
+  "TTS_VOICE_ID",            // Voice id — ElevenLabs/Edge id, or legacy MiniMax catalog/clone id
+  "TTS_MODEL",               // ElevenLabs: eleven_multilingual_v2 · legacy MiniMax: speech-02-hd
   "TTS_SPLIT_TYPE",          // smart | paragraphs | max_length
-  "TTS_LANGUAGE_BOOST",      // MiniMax pronunciation hint, e.g. English | auto
+  "TTS_LANGUAGE_BOOST",      // ElevenLabs/MiniMax pronunciation hint, e.g. English | auto
 
   // ── ElevenLabs voice fine-tuning ──────────────────────────────────
   "TTS_SPEED",               // 0.7–1.2 (lower = slower)
@@ -49,7 +50,7 @@ export const SETTING_KEYS = [
   "TTS_PAUSE_FREQUENCY",     // 1–100
 
   // ── Images ────────────────────────────────────────────────────────
-  "IMAGE_PROVIDER",          // 69labs | replicate | openai | fal
+  "IMAGE_PROVIDER",          // 69labs | replicate | openai | fal | off (legacy only)
   "IMAGE_MODEL",             // e.g. nano-banana-pro, imagen-4, seedream-4.5
   "IMAGE_RATIO",             // e.g. 16:9, 9:16, 1:1
   "IMAGE_RESOLUTION",        // 1k | 2k | 4k (for models that support it)
@@ -61,13 +62,15 @@ export const SETTING_KEYS = [
   "ANIMATION_DISTRIBUTION",  // first-half | alternating | random | all
   "ANIMATION_DURATION",      // seconds (provider-dependent)
   "ANIMATION_KEEP_VEO_AUDIO", // "1" to keep Veo's generated ambient audio
+  "VIDEO_STYLE",             // global video look/mood, appended to every scene's visual_prompt (replaces the legacy animation_motion prompt)
+  "VISUAL_CONTINUITY_MODE",  // off | prompt | keyframe — see src/lib/continuity.ts. Default "prompt".
 
   // ── Video assembly (FFmpeg) ───────────────────────────────────────
   "VIDEO_RESOLUTION",        // e.g. 1920x1080
   "VIDEO_FPS",               // 24 / 30 / 60
   "SCENE_DURATION_SECONDS",  // fallback duration when TTS length is unknown
   "TRANSITION_DURATION",     // crossfade between scenes in seconds (0 = none)
-  "SCENE_TAIL_SILENCE",      // silence appended to each clip's audio (seconds), creates breathing room between scenes
+  "SCENE_TAIL_SILENCE",      // deprecated: continuous-voiceover — no inter-scene gaps (kept for old runs)
 
   // ── Performance / Concurrency ─────────────────────────────────────
   "IMAGE_CONCURRENCY",       // parallel image jobs
@@ -163,17 +166,19 @@ export const DEFAULTS: Record<SettingKey, string> = {
   SCENE_SPLIT_PROVIDER: "google",
   SCENE_SPLIT_MODEL: "gemini-flash-latest",
 
-  // TTS — Conveyer Hum defaults to MiniMax via the 69labs gateway.
-  // Switch to 69labs (edge/eleven) / elevenlabs / openai via /settings if needed.
-  TTS_PROVIDER: "minimax",
-  TTS_VOICE_PROVIDER: "edgetts",
-  TTS_VOICE_ID: "English_Comedian",
-  TTS_MODEL: "speech-02-hd",
+  // TTS — Conveyer Hum defaults to ElevenLabs via the 69labs gateway.
+  // (TTS_PROVIDER=69labs + TTS_VOICE_PROVIDER=elevenlabs.) Switch to direct
+  // elevenlabs / openai, or legacy minimax, via /advanced if needed.
+  STYLE_PRESET_ID: "sleep-calm",          // no-channel run's style preset (Prompt 9)
+  TTS_PROVIDER: "69labs",
+  TTS_VOICE_PROVIDER: "elevenlabs",
+  TTS_VOICE_ID: "",
+  TTS_MODEL: "eleven_multilingual_v2",
   TTS_SPLIT_TYPE: "smart",
   TTS_LANGUAGE_BOOST: "English",
 
   // Voice fine-tuning (slightly slower + small style for documentary feel)
-  TTS_SPEED: "0.93",
+  TTS_SPEED: "0.85",
   TTS_STABILITY: "0.6",
   TTS_SIMILARITY_BOOST: "0.75",
   TTS_STYLE: "0.15",
@@ -184,27 +189,35 @@ export const DEFAULTS: Record<SettingKey, string> = {
   TTS_PAUSE_DURATION: "0.4",
   TTS_PAUSE_FREQUENCY: "1",
 
-  // Images — Conveyer Hum is video-only. These defaults are kept only so
-  // that legacy DB rows don't crash anything; the pipeline never reads them.
-  IMAGE_PROVIDER: "off",
+  // Images — generated first, then used as first-frame keyframes for video.
+  IMAGE_PROVIDER: "69labs",
   IMAGE_MODEL: "nano-banana-pro",
   IMAGE_RATIO: "16:9",
   IMAGE_RESOLUTION: "1k",
 
-  // Animations — Conveyer Hum animates EVERY scene through Grok via 69labs.
+  // Animations — Conveyer Hum animates EVERY scene through 69labs.
   ANIMATION_PROVIDER: "69labs",
-  ANIMATION_MODEL: "grok-imagine-video",  // xAI Grok video via 69labs (text-to-video)
+  ANIMATION_MODEL: "veo-video",           // Veo 3.1 Fast via 69labs (image-to-video); grok-imagine-video is the legacy option
   ANIMATION_RATIO_PERCENT: "100",         // 100 % of scenes animated, no Ken-Burns mix
   ANIMATION_DISTRIBUTION: "all",
   ANIMATION_DURATION: "",                 // ignored by Grok (69labs hard-codes ~6s); applies only to non-Grok/non-Veo models
   ANIMATION_KEEP_VEO_AUDIO: "",           // legacy name — applies to any model with embedded audio
+  // Global video look/mood, appended to every scene's visual_prompt. Darker /
+  // slower "sleep content" seed; channels can override per-channel.
+  VIDEO_STYLE:
+    "Slow cinematic documentary motion, low-key lighting with deep shadows and muted earth tones, soft contrast, no harsh highlights, dreamlike pacing, gentle ambient camera drift, photographic realism with a quiet contemplative atmosphere — feels like a hushed nature documentary at dusk.",
+  // Visual continuity between consecutive scenes in the same shot. "prompt"
+  // appends the previous scene's identity hint to the next image prompt
+  // (no extra paid calls). "keyframe" would chain the previous video's last
+  // frame as the next image — not enabled today; see src/lib/continuity.ts.
+  VISUAL_CONTINUITY_MODE: "prompt",
 
   // Video assembly
   VIDEO_RESOLUTION: "1920x1080",
   VIDEO_FPS: "30",
   SCENE_DURATION_SECONDS: "5",
   TRANSITION_DURATION: "0.5",
-  SCENE_TAIL_SILENCE: "0.4",
+  SCENE_TAIL_SILENCE: "1.0",              // deprecated: continuous-voiceover (no inter-scene gaps); kept for old runs
 
   // Performance
   IMAGE_CONCURRENCY: "5",
@@ -236,12 +249,14 @@ export function seedDefaults() {
     if (!row) upsertStmt.run(k, v);
   }
   forceVideoOnlyMode();
+  enableImageKeyframeMode();
 }
 
 /**
- * One-time correction for users coming from the Hum Conveyer template (Veo →
- * Grok migration). Conveyer Hum runs Grok via 69labs for every scene, so we
- * flip any inherited `veo-*` model IDs to `grok-imagine-video` on first boot.
+ * One-time correction for users coming from the Hum Conveyer template: force
+ * video generation on and animate 100% of scenes on first boot. The video MODEL
+ * is left alone — Conveyer Hum defaults to Veo 3.1 Fast (`veo-video`) and Grok
+ * stays a switchable option.
  * Tracked via a flag so we never overwrite a user's later manual choice.
  */
 function forceVideoOnlyMode() {
@@ -252,9 +267,6 @@ function forceVideoOnlyMode() {
     ["ANIMATION_PROVIDER", (v) => (v === "off" ? "69labs" : null)],
     ["ANIMATION_RATIO_PERCENT", (v) => (v !== "100" ? "100" : null)],
     ["ANIMATION_DISTRIBUTION", (v) => (v !== "all" ? "all" : null)],
-    ["IMAGE_PROVIDER", (v) => (v && v !== "off" ? "off" : null)],
-    // Migrate inherited Veo model IDs from Hum Conveyer template
-    ["ANIMATION_MODEL", (v) => (/^veo/i.test(v) ? "grok-imagine-video" : null)],
   ];
   for (const [key, transform] of rules) {
     const row = getStmt.get(key) as { value: string } | undefined;
@@ -265,4 +277,21 @@ function forceVideoOnlyMode() {
     }
   }
   upsertStmt.run("_migration_grok_video_only", "1");
+}
+
+/**
+ * 2026-05-28: restore the image-keyframed pipeline. Older Conveyer Hum rows
+ * intentionally set IMAGE_PROVIDER=off for text-to-video; switch only that
+ * legacy/off value back to 69labs, preserving any explicit alternative.
+ */
+function enableImageKeyframeMode() {
+  const flag = getStmt.get("_migration_image_keyframes_20260528") as { value: string } | undefined;
+  if (flag?.value === "1") return;
+
+  const row = getStmt.get("IMAGE_PROVIDER") as { value: string } | undefined;
+  const current = row?.value?.trim().toLowerCase();
+  if (!current || current === "off") {
+    upsertStmt.run("IMAGE_PROVIDER", "69labs");
+  }
+  upsertStmt.run("_migration_image_keyframes_20260528", "1");
 }

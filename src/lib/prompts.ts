@@ -1,56 +1,43 @@
 import db from "./db";
+import { DEFAULT_STYLE_PRESET_ID, loadStylePreset } from "./style-presets";
 
 export const PROMPT_NAMES = ["scene_split", "image_prompt", "animation_motion"] as const;
 export type PromptName = (typeof PROMPT_NAMES)[number];
 
 export const DEFAULT_PROMPTS: Record<PromptName, string> = {
-  scene_split: `You are the editor of a faceless YouTube longevity / health / Blue Zone documentary channel for an audience aged 50–75.
-Split the provided script into scenes for an automated AI video pipeline.
+  scene_split: `You are a video editor for a faceless YouTube channel. Split the provided script into scenes for an automated AI video pipeline (one short narrated clip per scene).
 
-WHY SCENE LENGTH MATTERS (read this before splitting):
-  The video generator (xAI Grok via 69labs) produces FIXED ~6-second clips —
-  69labs hard-blocks the duration parameter for Grok (runtime restriction,
-  not a format issue). We keep scenes SHORT so the ~6 s clip covers each
-  scene's narration end-to-end with real motion. Going past ~6 s of audio
-  means the visual freezes (or loops) on the last frame, which looks bad.
+HOW TO SPLIT — cut by IDEA, not by sentence:
+  Each scene is ONE complete idea or beat. Read for meaning, not punctuation.
 
-CRITICAL RULES:
-1. Cover the ENTIRE script verbatim, with NO omissions, no summarizing, no paraphrasing.
-2. The concatenation of every scene's "text" field (joined by spaces) MUST equal the original script word-for-word.
-3. Do NOT summarize. Do NOT add commentary. Do NOT reorder words.
-4. **NEVER split a sentence in the middle.** A sentence ends ONLY at a period (.), question mark (?), or exclamation mark (!). Commas, semicolons, dashes, and colons are NOT sentence boundaries — they MUST stay inside one scene.
-5. **TARGET SCENE LENGTH: 8–13 words, ~50–80 characters, ~3.5–5.5 seconds of narration.**
-6. **HARD MAX: 15 words / 90 characters / ~6 seconds per scene.** The Grok clip is exactly ~6s — scenes any longer freeze on the last frame. If a single sentence is naturally longer than 15 words, give it its own scene (rule 4 takes priority — never split mid-sentence).
-7. **Prefer 1 short sentence per scene.** Two very short clauses sharing a beat are OK if both under 7 words combined. Documentary pacing — but tighter than long-form because of the 6-second clip ceiling.
-8. Section headings ("Part one — The Blue Zone secret.") get their own short scene.
-9. Long single sentences are OK as standalone scenes, but flag them — they may look near-frozen at the end.
+SCENE LENGTH:
+- Target: 6–8 seconds of narration per scene (roughly 12–20 words at a calm speaking pace).
+- Hard maximum: 8 seconds (~20 words). Never exceed this.
+- Minimum: 4 seconds (~10 words). A slice shorter than 4 seconds is NOT a complete idea — merge it with a neighbor (merge forward unless that would push the combined scene past 8 seconds, in which case merge backward).
+- A 2–4 word fragment is never its own scene. Always merge fragments.
+
+SENTENCE & CLAUSE RULES:
+- Prefer breaking on sentence boundaries (. ? !) whenever the sentence fits in 6–8 seconds.
+- Two short related sentences MAY share one scene if their combined narration is ≤ 8 seconds.
+- If a SINGLE sentence is longer than 8 seconds, split it at the nearest natural clause boundary, in this priority order: em-dash (—), semicolon (;), colon (:), comma (,). Never split in the middle of a clause or phrase.
+
+VERBATIM COVERAGE (critical):
+- Cover the ENTIRE script word-for-word. No omissions, no summarizing, no paraphrasing, no reordering, no punctuation changes.
+- The concatenation of every scene's "text" field, joined with single spaces, MUST equal the original script exactly.
 
 For EACH scene, return a JSON object with:
-- "text": the exact verbatim slice of the script (no edits, no punctuation changes).
-- "visual_prompt": a 60–120-word English prompt for the AI video generator that LITERALLY illustrates the content of this scene's text, framed as a documentary nature/lifestyle shot for a longevity channel.
-  VISUAL VOCABULARY (the channel's world):
-  • Mediterranean / Blue Zone settings: Sardinian stone villages, Greek islands at golden hour, Ikarian fishing harbors, Okinawan gardens, Loma Linda farms, Nicoyan tropical valleys, rolling olive groves, terraced vineyards, sun-bleached coastal cliffs.
-  • Food + kitchens: rustic wooden tables, hand-kneaded bread, olive oil drizzling on greens, fresh herbs and garlic, simmering legume stews, fish on stone grills, raw whole foods, fruit markets, hand-pressed wine, mortar and pestle.
-  • Nature + ambience: morning mist over hillsides, late-afternoon sun through olive trees, ocean waves on rocks, farm animals at distance, garden close-ups, hands tending soil, dappled sunlight on dirt paths.
-  • Anti-aging metaphors when narration is abstract: time-lapse of fruit ripening, cells under microscope (warm-toned), DNA strands subtle, blood flow through capillaries (medical-illustration realism), aged stone weathering, growth rings on cut wood.
-  PEOPLE RULES:
-  • NO faces in close-up. NO recognizable identities — Grok cannot reliably depict specific real people (Dan Buettner, etc.), so don't ask for them.
-  • Anonymous elderly figures are OK only as background / silhouettes / hands / back-of-head shots: a weathered hand chopping greens, an old shepherd walking a hillside path seen from behind, hands holding a clay bowl, a grandmother stirring a pot (camera over her shoulder).
-  • Absolutely NO children or young adults in frame — channel is 70+ active aging.
-  • If the script names a person (scientist, centenarian), substitute an evocative ENVIRONMENT shot or food shot, not a faked portrait.
-  CAMERA + STYLE (this is just SUBSTANCE — style suffix is appended later):
-  • Real-world cinematography vocabulary: "slow dolly across...", "macro close-up on...", "overhead shot of...", "golden-hour wide shot of...", "lens flare through olive branches", "shallow depth of field", "35mm documentary feel".
-  • Describe MOTION explicitly — Grok generates animated clips, so include subtle camera or subject motion (slow push-in, gentle parallax, steam rising, hands moving, sunlight shifting).
-  PROHIBITED:
-  • No text overlays, captions, logos, watermarks, brand names visible in frame.
-  • No cartoon/anime/illustrative/painterly styling.
-  • No fantasy, sci-fi, futuristic tech, hospital scenes, sick or frail bodies.
-  • No clickbait visuals (huge bold "5" digits, before/after shock, etc.).
-- "duration_hint_sec": approximate audio length (number, 3–6).
+- "text": the exact verbatim slice of the script for this scene (no edits, no punctuation changes).
+- "visual_prompt": a 40–90-word English description of a single cinematic shot that literally illustrates this scene's text. Describe the subject, the setting, and explicit camera or subject motion (slow push-in, gentle parallax, drifting light, rising mist). Photographic realism. No on-screen text, captions, logos, or watermarks. No recognizable real people or faces in close-up. The channel's overall look (lighting, mood, color grade) is appended automatically afterward — describe SUBSTANCE here, not style.
+- "duration_hint_sec": estimated narration length in seconds (number, 4–8).
 
-Return a STRICTLY valid JSON array — no markdown, no explanations.
+VISUAL CONTINUITY (additional fields — emit honestly; do NOT fake continuity):
+- "continuity_group_id": a short kebab-case slug naming the SHOT IDENTITY (e.g. "ship-charleston-harbor", "blackbeard-deck", "blockade-charleston-1718"). Consecutive scenes that show the SAME subject + same location + same time of day MUST share the same group id. Different subject / different place / major time jump = a NEW group id.
+- "continuity_break": true when this scene introduces a new place, new subject, new time of day, or a deliberate cut to a different shot type that should NOT carry visual identity from the previous scene. Set true on the FIRST scene of a new group. Otherwise false. The first scene of the whole script is always true.
+- "continuity_hint": a 12–25-word identity carrier — the specific subject (e.g. "a massive 1718 wooden three-masted pirate ship, 40 cannon ports, black hull, weathered sails"), the era/wardrobe, lighting and palette. Reused by the pipeline to anchor the next scene's image to the same subject. Empty string when not applicable.
 
-For a ~1500-word script expect ~120–170 scenes. For a ~3000-word script expect ~240–340 scenes. If any "text" field is longer than 90 characters, you missed the limit — recount and re-split.`,
+Honest rule: a tight close-up after a wide shot of the SAME ship is the same group (continuity_break: false). A cut to a new harbor, a new character, or a flashback is a different group (continuity_break: true). Do not chain everything — chaining a close-up of a beard to a wide ocean shot would just blur the identity.
+
+Return ONLY a strictly valid JSON array — no markdown, no commentary.`,
 
   image_prompt: `documentary photography, photoreal, NatGeo / BBC Earth cinematography style, golden-hour Mediterranean light, warm earth tones, natural color grading, soft contrast, 35mm full-frame, shallow depth of field on close-ups, wide cinematic landscape for environments, sharp focus, 16:9 aspect ratio, no text overlays, no watermarks, no logos, no captions, no recognizable faces in close-up, no young people, no children, no sick or hospitalized bodies, no cartoon stylization, no painterly artwork, no fantasy elements, no sci-fi, no clickbait graphics`,
 
@@ -102,12 +89,32 @@ export interface PromptPreset {
   content: string;
   /** human-readable note about the channel (optional) */
   description: string | null;
-  /** animation_motion override (optional — NULL means fall back to global default) */
-  animation_motion: string | null;
-  /** image_prompt override (optional — currently unused since Conveyer Hum is video-only) */
-  image_prompt: string | null;
-  /** per-channel MiniMax voice id (optional — NULL means use the global TTS_VOICE_ID setting) */
+  /** style preset id (Prompt 9) — drives the scene-split prompt + default tuning. NULL = sleep-calm. */
+  style_preset_id: string | null;
+  /** video style override — appended to every scene's visual_prompt (optional — NULL = preset/global). */
+  video_style: string | null;
+  /** video model override (e.g. veo-video) — NULL = global ANIMATION_MODEL. */
+  video_model: string | null;
+  /** aspect ratio override (e.g. 16:9) — NULL = global IMAGE_RATIO. */
+  aspect_ratio: string | null;
+  /** voice speed override 0.5–1.5 — NULL = preset/global. */
+  voice_speed: number | null;
+  /** voice stability 0–1 — NULL = preset/global TTS_STABILITY. */
+  voice_stability: number | null;
+  /** voice similarity boost 0–1 — NULL = preset/global TTS_SIMILARITY_BOOST. */
+  voice_similarity_boost: number | null;
+  /** voice style 0–1 — NULL = preset/global TTS_STYLE. */
+  voice_style: number | null;
+  /** per-channel voice id (optional — NULL = global TTS_VOICE_ID). Set via the voice library picker. */
   voice_id: string | null;
+  /** TTS provider for the per-channel voice (voice-clone | elevenlabs | edgetts). NULL = global TTS_VOICE_PROVIDER. */
+  voice_provider: string | null;
+  /** @deprecated scene-end pause — continuous voiceover has no inter-scene gaps */
+  scene_end_pause_seconds: number | null;
+  /** @deprecated legacy animation_motion override — superseded by video_style */
+  animation_motion: string | null;
+  /** @deprecated legacy per-channel image prompt override — currently unused */
+  image_prompt: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -115,15 +122,23 @@ export interface PromptPreset {
 /** Fields accepted when creating/updating a channel profile. */
 export interface PromptPresetInput {
   name: string;
-  content: string;
+  /** @deprecated — scene-split prompt now comes from the style preset; auto-filled if omitted. */
+  content?: string;
   description?: string | null;
-  animation_motion?: string | null;
-  image_prompt?: string | null;
+  style_preset_id?: string | null;
+  video_style?: string | null;
+  video_model?: string | null;
+  aspect_ratio?: string | null;
+  voice_speed?: number | null;
+  voice_stability?: number | null;
+  voice_similarity_boost?: number | null;
+  voice_style?: number | null;
   voice_id?: string | null;
+  voice_provider?: string | null;
 }
 
 const PRESET_COLS =
-  "id, name, content, description, animation_motion, image_prompt, voice_id, created_at, updated_at";
+  "id, name, content, description, style_preset_id, video_style, video_model, aspect_ratio, voice_speed, voice_stability, voice_similarity_boost, voice_style, voice_id, voice_provider, animation_motion, image_prompt, created_at, updated_at";
 
 const listPresetsStmt = db.prepare(
   `SELECT ${PRESET_COLS} FROM prompt_presets ORDER BY name COLLATE NOCASE ASC`
@@ -131,10 +146,10 @@ const listPresetsStmt = db.prepare(
 const getPresetStmt = db.prepare(`SELECT ${PRESET_COLS} FROM prompt_presets WHERE id = ?`);
 const getPresetByNameStmt = db.prepare(`SELECT ${PRESET_COLS} FROM prompt_presets WHERE name = ?`);
 const createPresetStmt = db.prepare(
-  "INSERT INTO prompt_presets (name, content, description, animation_motion, image_prompt, voice_id) VALUES (?, ?, ?, ?, ?, ?)"
+  "INSERT INTO prompt_presets (name, content, description, style_preset_id, video_style, video_model, aspect_ratio, voice_speed, voice_stability, voice_similarity_boost, voice_style, voice_id, voice_provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 );
 const updatePresetStmt = db.prepare(
-  "UPDATE prompt_presets SET name = ?, content = ?, description = ?, animation_motion = ?, image_prompt = ?, voice_id = ?, updated_at = datetime('now') WHERE id = ?"
+  "UPDATE prompt_presets SET name = ?, content = ?, description = ?, style_preset_id = ?, video_style = ?, video_model = ?, aspect_ratio = ?, voice_speed = ?, voice_stability = ?, voice_similarity_boost = ?, voice_style = ?, voice_id = ?, voice_provider = ?, updated_at = datetime('now') WHERE id = ?"
 );
 const deletePresetStmt = db.prepare("DELETE FROM prompt_presets WHERE id = ?");
 
@@ -159,17 +174,37 @@ function normalizeOptional(s: string | null | undefined): string | null {
   return trimmed.length > 0 ? s : null;
 }
 
+/** Normalize an optional numeric field — null/empty/NaN becomes NULL (means "inherit global"). */
+function normalizeNumber(n: number | string | null | undefined): number | null {
+  if (n == null || n === "") return null;
+  const v = typeof n === "number" ? n : parseFloat(n);
+  return Number.isFinite(v) ? v : null;
+}
+
+/** Scene-split prompt now lives in code per style preset; keep the legacy NOT NULL
+ *  `content` column populated with that prompt so old rows/diagnostics still read sensibly. */
+function resolveContent(input: PromptPresetInput): string {
+  if (input.content && input.content.trim()) return input.content;
+  return loadStylePreset(input.style_preset_id ?? DEFAULT_STYLE_PRESET_ID).sceneSplitPrompt;
+}
+
 export function createPromptPreset(input: PromptPresetInput): number {
   const trimmedName = input.name.trim();
   if (!trimmedName) throw new Error("Channel name cannot be empty");
-  if (!input.content.trim()) throw new Error("Channel scene_split prompt cannot be empty");
   const result = createPresetStmt.run(
     trimmedName,
-    input.content,
+    resolveContent(input),
     normalizeOptional(input.description),
-    normalizeOptional(input.animation_motion),
-    normalizeOptional(input.image_prompt),
-    normalizeOptional(input.voice_id)
+    normalizeOptional(input.style_preset_id) ?? DEFAULT_STYLE_PRESET_ID,
+    normalizeOptional(input.video_style),
+    normalizeOptional(input.video_model),
+    normalizeOptional(input.aspect_ratio),
+    normalizeNumber(input.voice_speed),
+    normalizeNumber(input.voice_stability),
+    normalizeNumber(input.voice_similarity_boost),
+    normalizeNumber(input.voice_style),
+    normalizeOptional(input.voice_id),
+    normalizeOptional(input.voice_provider)
   );
   return Number(result.lastInsertRowid);
 }
@@ -177,14 +212,20 @@ export function createPromptPreset(input: PromptPresetInput): number {
 export function updatePromptPreset(id: number, input: PromptPresetInput): void {
   const trimmedName = input.name.trim();
   if (!trimmedName) throw new Error("Channel name cannot be empty");
-  if (!input.content.trim()) throw new Error("Channel scene_split prompt cannot be empty");
   const result = updatePresetStmt.run(
     trimmedName,
-    input.content,
+    resolveContent(input),
     normalizeOptional(input.description),
-    normalizeOptional(input.animation_motion),
-    normalizeOptional(input.image_prompt),
+    normalizeOptional(input.style_preset_id) ?? DEFAULT_STYLE_PRESET_ID,
+    normalizeOptional(input.video_style),
+    normalizeOptional(input.video_model),
+    normalizeOptional(input.aspect_ratio),
+    normalizeNumber(input.voice_speed),
+    normalizeNumber(input.voice_stability),
+    normalizeNumber(input.voice_similarity_boost),
+    normalizeNumber(input.voice_style),
     normalizeOptional(input.voice_id),
+    normalizeOptional(input.voice_provider),
     id
   );
   if (result.changes === 0) throw new Error(`Channel profile id=${id} not found`);

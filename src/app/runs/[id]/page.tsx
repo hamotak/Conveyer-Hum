@@ -136,6 +136,10 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
   const fileUrl = (p: string, dl = false) =>
     `/api/runs/${id}/file?p=${encodeURIComponent(p)}${dl ? "&download=1" : ""}`;
 
+  // First fetch sets run/assets/drive together, so `assets === null` means the
+  // initial load hasn't returned yet — show skeletons, not a bare log wall.
+  const loaded = assets !== null;
+
   return (
     <div>
       <div
@@ -157,9 +161,37 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
               Stop
             </button>
           )}
-          {run && <span className={`tag tag-${run.status}`}>{run.status}</span>}
+          {run ? (
+            <span className={`tag tag-${run.status}`}>{run.status}</span>
+          ) : (
+            <span className="skeleton skeleton-pill" />
+          )}
         </div>
       </div>
+
+      {/* ─── Initial load — premium skeleton (hero + actions + timeline) ──── */}
+      {!loaded && (
+        <>
+          <div className="card" style={{ marginBottom: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, gap: 12 }}>
+              <div className="skeleton skeleton-line" style={{ width: 110, height: 16 }} />
+              <div style={{ display: "flex", gap: 8 }}>
+                <div className="skeleton" style={{ width: 124, height: 36 }} />
+                <div className="skeleton" style={{ width: 104, height: 36 }} />
+              </div>
+            </div>
+            <div className="skeleton" style={{ width: "100%", height: 340, borderRadius: "var(--r-sm)" }} />
+          </div>
+          <div className="card" style={{ marginBottom: 14 }}>
+            <div className="skeleton skeleton-line" style={{ width: 130, height: 13, marginBottom: 12 }} />
+            <div style={{ display: "flex", gap: 7 }}>
+              {Array.from({ length: 10 }).map((_, i) => (
+                <div key={i} className="skeleton" style={{ width: 42, height: 44, flexShrink: 0 }} />
+              ))}
+            </div>
+          </div>
+        </>
+      )}
 
       {/* ─── Resume banner — failed/cancelled run with assets on disk ────── */}
       {(run?.status === "error" || run?.status === "cancelled") &&
@@ -213,9 +245,50 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
           </div>
           <video
             controls
+            preload="metadata"
+            playsInline
+            poster={fileUrl("final-poster.jpg")}
             style={{ width: "100%", maxHeight: 480, borderRadius: "var(--r-sm)", background: "#000" }}
             src={fileUrl("final.mp4")}
           />
+        </div>
+      )}
+
+      {/* ─── Scene timeline (foundation — overview now; reorder/replace/
+           regenerate per scene to come). Compact strip, not an editor. ──── */}
+      {assets && assets.scenes.length > 0 && (
+        <div className="card" style={{ marginBottom: 14 }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 10 }}>
+            <h2 style={{ margin: 0, fontSize: 15 }}>Scene timeline</h2>
+            <span className="faint" style={{ fontSize: 12 }}>{assets.scenes.length} scenes</span>
+          </div>
+          <div className="scene-strip">
+            {assets.scenes.map((s) => {
+              const hasClip = !!(s.animation || s.clip);
+              return (
+                <div
+                  key={s.index}
+                  className="scene-chip"
+                  title={`Scene ${s.index + 1}${hasClip ? " · clip ready" : " · no clip yet"}`}
+                >
+                  <span className="scene-chip-num">S{s.index + 1}</span>
+                  <span className={`scene-chip-dot${hasClip ? " ready" : ""}`} aria-hidden="true" />
+                </div>
+              );
+            })}
+          </div>
+          <div className="faint" style={{ fontSize: 11, marginTop: 9 }}>
+            Per-scene reorder, replace and regenerate will live here.
+          </div>
+        </div>
+      )}
+
+      {/* Final video exists but the raw scene clips were cleaned up locally. */}
+      {loaded && assets?.finalExists && assets.scenes.length === 0 && (
+        <div className="card" style={{ marginBottom: 14 }}>
+          <div className="faint" style={{ fontSize: 12.5 }}>
+            Final video is available. Scene clips were cleaned up locally.
+          </div>
         </div>
       )}
 
@@ -288,18 +361,25 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
         </div>
       )}
 
-      {/* ─── Logs ───────────────────────────────────────────────────────── */}
-      <div className="card" style={{ marginBottom: 14, padding: 0, overflow: "hidden" }}>
-        <div
+      {/* ─── Logs (only after load; collapsed unless running — calmer) ────── */}
+      {loaded && (
+      <details
+        className="card"
+        style={{ marginBottom: 14, padding: 0, overflow: "hidden" }}
+        open={run?.status === "running" || run?.status === "pending"}
+      >
+        <summary
           style={{
             fontWeight: 650,
             fontSize: 13,
             padding: "12px 16px",
-            borderBottom: "1px solid var(--border)",
+            cursor: "pointer",
           }}
         >
-          Live logs
-        </div>
+          {run?.status === "running" || run?.status === "pending"
+            ? "Live logs"
+            : `Logs${logs.length ? ` · ${logs.length} lines` : ""}`}
+        </summary>
         <div
           className="mono"
           style={{
@@ -309,6 +389,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
             fontSize: 11.5,
             padding: "10px 16px",
             lineHeight: 1.7,
+            borderTop: "1px solid var(--border)",
           }}
         >
           {logs.length === 0 && <div className="faint">Waiting for logs…</div>}
@@ -322,22 +403,26 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
           ))}
           <div ref={tail} />
         </div>
-      </div>
+      </details>
+      )}
 
-      {/* ─── Scene assets ───────────────────────────────────────────────── */}
+      {/* ─── Scene assets (compact, collapsed by default — calmer) ───────── */}
       {assets && assets.scenes.length > 0 && (
-        <div className="card">
-          <h2 style={{ marginBottom: 12 }}>Scene assets · {assets.scenes.length}</h2>
+        <details className="card">
+          <summary style={{ cursor: "pointer", fontWeight: 650, fontSize: 14 }}>
+            Scene assets · {assets.scenes.length}
+          </summary>
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "repeat(auto-fill, minmax(210px, 1fr))",
-              gap: 10,
+              gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))",
+              gap: 8,
+              marginTop: 12,
             }}
           >
             {assets.scenes.map((s) => (
               <div key={s.index} className="card-inset" style={{ padding: 10 }}>
-                <div style={{ fontWeight: 650, fontSize: 12.5, marginBottom: 7 }}>Scene #{s.index}</div>
+                <div style={{ fontWeight: 650, fontSize: 12.5, marginBottom: 7 }}>Scene {s.index + 1}</div>
                 {s.image && (
                   <a href={fileUrl(`images/${s.image.name}`, true)} title="Download image">
                     <img
@@ -379,7 +464,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
               </div>
             ))}
           </div>
-        </div>
+        </details>
       )}
     </div>
   );

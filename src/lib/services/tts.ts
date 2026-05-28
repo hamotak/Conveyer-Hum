@@ -1,10 +1,14 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { getSetting } from "../settings";
 import { log } from "../logger";
 import type { Scene } from "./scene-split";
-import { createTtsJob, pollJob, downloadJob } from "./labs69";
+import { createTtsJob, pollJob, downloadJob, cancelJob, releaseJob } from "./labs69";
 import { probeDurationSafe } from "./video-assemble";
+import { CancelledError, isCancelled, registerJob, unregisterJob } from "../cancellation";
+import { pickVoiceId } from "../voice-resolve";
 
 export interface TtsResult {
   /** Path to the mp3 file. */
@@ -28,48 +32,76 @@ export interface TtsResult {
  * pipeline passes it here so that channel's runs use that voice instead of the
  * global TTS_VOICE_ID setting. Empty/null → use the global setting.
  */
+export interface TtsOptions {
+  /** Per-channel voice id — wins over the global TTS_VOICE_ID setting. */
+  voiceOverride?: string | null;
+  /** Per-channel voice speed — wins over the global TTS_SPEED setting. */
+  speedOverride?: number | null;
+  /** Per-channel voice provider (voice-clone | elevenlabs | edgetts) for the 69labs path. */
+  voiceProviderOverride?: string | null;
+  /** Per-channel ElevenLabs tuning — each wins over its global TTS_* setting. */
+  stabilityOverride?: number | null;
+  similarityOverride?: number | null;
+  voiceStyleOverride?: number | null;
+}
+
+/** Dispatch one TTS request to the configured provider, writing to `filePath`. */
+async function dispatchTts(runId: string, text: string, filePath: string, options: TtsOptions) {
+  const provider = (getSetting("TTS_PROVIDER") || "minimax").toLowerCase();
+  if (provider === "minimax") {
+    await minimaxTts(runId, text, filePath, options.voiceOverride, options.speedOverride);
+  } else if (provider === "69labs") {
+    await labs69Tts(runId, text, filePath, options);
+  } else if (provider === "elevenlabs") {
+    await elevenLabs(text, filePath, options.voiceOverride);
+  } else if (provider === "openai") {
+    await openaiTts(text, filePath, options.voiceOverride);
+  } else {
+    throw new Error(`Unknown TTS provider: ${provider}`);
+  }
+}
+
 export async function synthesizeScene(
   runId: string,
   scene: Scene,
   outDir: string,
-  options: { voiceOverride?: string | null } = {}
+  options: TtsOptions = {}
 ): Promise<TtsResult> {
-  const provider = (getSetting("TTS_PROVIDER") || "minimax").toLowerCase();
   const fileName = `scene_${String(scene.index).padStart(3, "0")}.mp3`;
   const filePath = path.join(outDir, fileName);
-
-  log(runId, "info", `TTS scene #${scene.index} (${provider})`, {
-    stage: "tts",
-    data: { provider, text: scene.text.slice(0, 80) },
-  });
-
-  if (provider === "minimax") {
-    await minimaxTts(runId, scene.text, filePath, options.voiceOverride);
-  } else if (provider === "69labs") {
-    await labs69Tts(runId, scene.text, filePath, options.voiceOverride);
-  } else if (provider === "elevenlabs") {
-    await elevenLabs(scene.text, filePath, options.voiceOverride);
-  } else if (provider === "openai") {
-    await openaiTts(scene.text, filePath, options.voiceOverride);
-  } else {
-    throw new Error(`Unknown TTS provider: ${provider}`);
-  }
-
-  // Real audio duration via ffprobe (falls back to a file-size estimate if
-  // ffprobe is unavailable). This value feeds the run log and library manifest,
-  // so it must be accurate — a wrong estimate here once read "~12s" for a 5s clip.
+  log(runId, "info", `TTS scene #${scene.index}`, { stage: "tts", data: { text: scene.text.slice(0, 80) } });
+  await dispatchTts(runId, scene.text, filePath, options);
   const durationSec = await probeDurationSafe(filePath);
-
-  log(runId, "success", `TTS done: ${fileName} (${durationSec.toFixed(1)}s)`, {
-    stage: "tts",
-  });
+  log(runId, "success", `TTS done: ${fileName} (${durationSec.toFixed(1)}s)`, { stage: "tts" });
   return { filePath, durationSec };
+}
+
+/**
+ * Continuous voiceover (Prompt 7): synthesize the ENTIRE script in one TTS call.
+ * One call = one consistent voice/speed and no inter-scene seams. Writes to
+ * `outPath` and returns its measured duration.
+ */
+export async function synthesizeFullScript(
+  runId: string,
+  text: string,
+  outPath: string,
+  options: TtsOptions = {}
+): Promise<TtsResult> {
+  const provider = (getSetting("TTS_PROVIDER") || "minimax").toLowerCase();
+  log(runId, "info", `TTS full script (${provider}, ${text.length} chars)`, { stage: "tts" });
+  await dispatchTts(runId, text, outPath, options);
+  const durationSec = await probeDurationSafe(outPath);
+  log(runId, "success", `Voiceover done: ${path.basename(outPath)} (${durationSec.toFixed(1)}s)`, { stage: "tts" });
+  return { filePath: outPath, durationSec };
 }
 
 /** A channel profile's voice id wins over the global TTS_VOICE_ID setting. */
 function resolveVoiceId(voiceOverride: string | null | undefined, fallback: string): string {
-  if (voiceOverride && voiceOverride.trim().length > 0) return voiceOverride.trim();
-  return getSetting("TTS_VOICE_ID") || fallback;
+  return pickVoiceId({
+    channel: voiceOverride,
+    global: getSetting("TTS_VOICE_ID"),
+    fallback,
+  });
 }
 
 /**
@@ -88,7 +120,8 @@ async function minimaxTts(
   runId: string,
   text: string,
   outPath: string,
-  voiceOverride?: string | null
+  voiceOverride?: string | null,
+  speedOverride?: number | null
 ) {
   const voiceId = resolveVoiceId(voiceOverride, "");
   if (!voiceId) {
@@ -103,7 +136,7 @@ async function minimaxTts(
   // raw API allows 0.01–10); `languageBoost` sharpens pronunciation for the
   // script's language.
   const minimaxSettings: { speed?: number; languageBoost?: string } = {};
-  const speed = parseFloatOr(getSetting("TTS_SPEED"), NaN);
+  const speed = speedOverride != null ? speedOverride : parseFloatOr(getSetting("TTS_SPEED"), NaN);
   if (!Number.isNaN(speed)) minimaxSettings.speed = clamp(speed, 0.5, 2);
   const languageBoost = getSetting("TTS_LANGUAGE_BOOST").trim();
   if (languageBoost) minimaxSettings.languageBoost = languageBoost;
@@ -123,33 +156,115 @@ async function minimaxTts(
       `speed=${minimaxSettings.speed ?? "default"}, lang=${minimaxSettings.languageBoost ?? "auto"})`,
     { stage: "tts" }
   );
+  // MiniMax accepts the job even when the voice/model is invalid, then fails it
+  // during processing — runTtsJob turns that into clear, actionable guidance.
+  await runTtsJob(
+    runId,
+    jobId,
+    outPath,
+    `The MiniMax voice id "${voiceId}" or model "${modelId}" is likely not valid for this account.`
+  );
+}
+
+/**
+ * Poll + download a TTS job, with the per-run job registry (so Stop can cancel
+ * the paid job) and cooperative cancellation woven through. Shared by every TTS
+ * call site so the registration / release / cancel logic lives in one place.
+ *
+ *  - registers the job on entry, unregisters on exit (always)
+ *  - checks for cancellation before polling and before download
+ *  - on user-cancel: actively cancels the paid 69labs job, then throws CancelledError
+ *  - on a real job FAILURE: frees the key slot pollJob holds and rethrows a clear
+ *    "this voice failed — pick another or test it first" message
+ */
+async function runTtsJob(runId: string, jobId: string, outPath: string, voiceHint: string): Promise<void> {
+  registerJob(runId, "tts", jobId);
   try {
-    await pollJob("tts", jobId, runId, "tts");
+    if (isCancelled(runId)) throw new CancelledError(`Run ${runId} cancelled`);
+    try {
+      await pollJob("tts", jobId, runId, "tts");
+    } catch (e) {
+      if (isCancelled(runId) || e instanceof CancelledError) throw e; // handled by outer catch
+      // pollJob does NOT release the key slot on failure — do it here so a bad
+      // voice doesn't permanently shrink the concurrency pool.
+      releaseJob(jobId);
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `This voice failed at TTS — pick another voice, or test it first with the "Test" button in the voice picker. ` +
+          `${voiceHint} [${msg}]`
+      );
+    }
+    if (isCancelled(runId)) throw new CancelledError(`Run ${runId} cancelled`);
+    await downloadJob("tts", jobId, outPath); // releases the slot in its own finally
   } catch (e) {
-    // MiniMax accepts the job request even when voice id / model id are invalid,
-    // then fails it during processing. Re-throw with a hint so the user knows
-    // exactly where to look.
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(
-      `${msg} — most often this means the MiniMax voice id "${voiceId}" or model "${modelId}" is not valid for this account. ` +
-        `Open the Voiceover tab in the app to browse the live MiniMax catalog and pick a working voice, then save it as TTS_VOICE_ID.`
-    );
+    if (isCancelled(runId) || e instanceof CancelledError) {
+      // Free the paid job + its slot, then surface a clean cancellation.
+      await cancelJob("tts", jobId).catch(() => {});
+      throw e instanceof CancelledError ? e : new CancelledError(`Run ${runId} cancelled`);
+    }
+    throw e;
+  } finally {
+    unregisterJob(runId, jobId);
   }
-  await downloadJob("tts", jobId, outPath);
+}
+
+/** Map a saved-voice provider string to a 69labs voiceProvider, defaulting to ElevenLabs. */
+function normalizeVoiceProvider(p: string): "elevenlabs" | "edgetts" | "voice-clone" | "minimax" {
+  const v = (p || "").toLowerCase().trim();
+  return v === "edgetts" || v === "voice-clone" || v === "minimax" ? v : "elevenlabs";
+}
+
+/**
+ * Synthesize a tiny sample with a specific voice for the "Test voice" button.
+ * Returns the mp3 bytes. Throws with a clear message when the voice fails — the
+ * whole point is to catch a bad voice BEFORE it burns a paid run. User-initiated
+ * only (one short clip), so it's a deliberate, minimal-cost generation.
+ */
+export async function synthesizeVoiceSample(
+  voiceId: string,
+  provider: string,
+  sampleText = "This is a test of the selected voice."
+): Promise<Buffer> {
+  const vid = voiceId.trim();
+  if (!vid) throw new Error("Voice ID is required to test a voice");
+  const voiceProvider = normalizeVoiceProvider(provider);
+  const modelId =
+    getSetting("TTS_MODEL") || (voiceProvider === "minimax" ? "speech-02-hd" : undefined);
+  const tmpPath = path.join(os.tmpdir(), `voice-test-${randomUUID()}.mp3`);
+
+  const jobId = await createTtsJob({
+    text: sampleText,
+    voiceId: vid,
+    voiceProvider,
+    modelId,
+    runId: "voice-test",
+  });
+  try {
+    // "voice-test" is never in the cancel registry, so this just polls +
+    // downloads, and (per the shared helper) frees the key slot if it fails.
+    await runTtsJob("voice-test", jobId, tmpPath, `The ${voiceProvider} voice id "${vid}" may be invalid for this account or 69labs plan.`);
+    return fs.readFileSync(tmpPath);
+  } finally {
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch {
+      /* temp file may not exist if the job never produced output */
+    }
+  }
 }
 
 /**
  * 69labs TTS via Edge TTS / ElevenLabs / a cloned voice — the alternate route
  * when TTS_PROVIDER is `69labs`. TTS_VOICE_PROVIDER selects the sub-engine.
  */
-async function labs69Tts(
-  runId: string,
-  text: string,
-  outPath: string,
-  voiceOverride?: string | null
-) {
+async function labs69Tts(runId: string, text: string, outPath: string, options: TtsOptions = {}) {
+  const { voiceOverride, speedOverride, voiceProviderOverride } = options;
   const voiceId = resolveVoiceId(voiceOverride, "en-US-GuyNeural");
-  const voiceProviderRaw = (getSetting("TTS_VOICE_PROVIDER") || "edgetts").toLowerCase();
+  const voiceProviderRaw = (
+    (voiceProviderOverride && voiceProviderOverride.trim()) ||
+    getSetting("TTS_VOICE_PROVIDER") ||
+    "edgetts"
+  ).toLowerCase();
   const voiceProvider =
     voiceProviderRaw === "elevenlabs" || voiceProviderRaw === "edgetts" || voiceProviderRaw === "voice-clone"
       ? (voiceProviderRaw as "elevenlabs" | "edgetts" | "voice-clone")
@@ -170,10 +285,13 @@ async function labs69Tts(
     useSpeakerBoost?: boolean;
   } = {};
   if (voiceProvider === "elevenlabs") {
-    const stability = parseFloatOr(getSetting("TTS_STABILITY"), NaN);
-    const similarity = parseFloatOr(getSetting("TTS_SIMILARITY_BOOST"), NaN);
-    const speed = parseFloatOr(getSetting("TTS_SPEED"), NaN);
-    const style = parseFloatOr(getSetting("TTS_STYLE"), NaN);
+    const stability =
+      options.stabilityOverride != null ? options.stabilityOverride : parseFloatOr(getSetting("TTS_STABILITY"), NaN);
+    const similarity =
+      options.similarityOverride != null ? options.similarityOverride : parseFloatOr(getSetting("TTS_SIMILARITY_BOOST"), NaN);
+    const speed = speedOverride != null ? speedOverride : parseFloatOr(getSetting("TTS_SPEED"), NaN);
+    const style =
+      options.voiceStyleOverride != null ? options.voiceStyleOverride : parseFloatOr(getSetting("TTS_STYLE"), NaN);
     const speakerBoost = getSetting("TTS_USE_SPEAKER_BOOST");
 
     if (!Number.isNaN(stability)) voiceSettings.stability = clamp(stability, 0, 1);
@@ -202,8 +320,14 @@ async function labs69Tts(
     runId,
   });
   log(runId, "debug", `69labs TTS job ${jobId.slice(0, 8)}… (${voiceProvider}/${voiceId}, speed=${voiceSettings.speed ?? "default"}, pause=${autoPauseEnabled ? `${autoPauseDuration}s` : "off"})`, { stage: "tts" });
-  await pollJob("tts", jobId, runId, "tts");
-  await downloadJob("tts", jobId, outPath);
+  // A bad saved/cloned voice id is the most common failure here — runTtsJob
+  // turns it into clear guidance and tracks the job for Stop.
+  await runTtsJob(
+    runId,
+    jobId,
+    outPath,
+    `The ${voiceProvider} voice id "${voiceId}" may be invalid for this account or 69labs plan.`
+  );
 }
 
 function parseFloatOr(s: string, fallback: number): number {

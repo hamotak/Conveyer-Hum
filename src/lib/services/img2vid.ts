@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getSetting } from "../settings";
-import { getPrompt } from "../prompts";
 import { log } from "../logger";
 import type { Scene } from "./scene-split";
 import { createVideoJob, pollJob, downloadJob, cancelJob, releaseJob } from "./labs69";
@@ -10,15 +9,11 @@ import { CancelledError, checkCancelled, isCancelled, registerJob, unregisterJob
 /**
  * Generates a short video clip for a scene.
  *
- * Conveyer Hum is video-only: every scene runs Grok in pure text-to-video mode
- * (no image keyframe), routed through 69labs. The legacy img2vid behavior —
- * chaining a generated image into the video model as the first frame — is
- * removed because we no longer have an image stage to chain from.
- *
- * If you ever want to re-enable image-keyframed video later, pass a non-null
- * `imagePath` AND make sure the upstream pipeline produced the image first.
- * Replicate / fal still expect an image; 69labs's grok-imagine-video accepts
- * a text-only prompt (which is what we use now).
+ * Normal scenes now run image-to-video: the pipeline first creates a still
+ * keyframe, then passes that image's provider job id into the video model so
+ * the first frame anchors style and subject consistency. Text-only generation
+ * is still used for synthetic buffer clips and legacy/manual calls with no
+ * imagePath.
  */
 export async function animateScene(
   runId: string,
@@ -28,9 +23,13 @@ export async function animateScene(
   options: {
     providerJobId?: string;
     imageProvider?: string;
-    /** Optional preset-level override for the animation_motion suffix.
-     *  Empty/null → fall back to global default from prompts table. */
-    motionOverride?: string | null;
+    /** Optional per-channel video style override appended to the visual_prompt.
+     *  Empty/null → fall back to the global VIDEO_STYLE setting. */
+    styleOverride?: string | null;
+    /** Per-channel video model — NULL → global ANIMATION_MODEL. */
+    modelOverride?: string | null;
+    /** Per-channel aspect ratio — NULL → global IMAGE_RATIO. */
+    aspectOverride?: string | null;
   } = {}
 ): Promise<string | null> {
   const provider = (getSetting("ANIMATION_PROVIDER") || "off").toLowerCase();
@@ -46,19 +45,26 @@ export async function animateScene(
   });
 
   if (provider === "69labs") {
+    if (imagePath && options.imageProvider !== "69labs") {
+      throw new Error(
+        "69labs image-to-video needs a 69labs image keyframe. Set IMAGE_PROVIDER=69labs, or use a video provider that accepts local image files."
+      );
+    }
     await labs69Img2Vid(
       runId,
       scene,
       options.providerJobId,
       options.imageProvider,
       filePath,
-      options.motionOverride
+      options.styleOverride,
+      options.modelOverride,
+      options.aspectOverride
     );
   } else if (provider === "replicate") {
-    if (!imagePath) throw new Error("Replicate Kling needs an image keyframe — not available in Conveyer Hum's video-only flow.");
+    if (!imagePath) throw new Error("Replicate Kling needs an image keyframe, but none was provided.");
     await replicateImg2Vid(scene, imagePath, filePath);
   } else if (provider === "fal") {
-    if (!imagePath) throw new Error("fal.ai Kling needs an image keyframe — not available in Conveyer Hum's video-only flow.");
+    if (!imagePath) throw new Error("fal.ai Kling needs an image keyframe, but none was provided.");
     await falImg2Vid(scene, imagePath, filePath);
   } else {
     throw new Error(`Unknown animation provider: ${provider}`);
@@ -74,21 +80,23 @@ async function labs69Img2Vid(
   providerJobId: string | undefined,
   imageProvider: string | undefined,
   outPath: string,
-  motionOverride?: string | null
+  styleOverride?: string | null,
+  modelOverride?: string | null,
+  aspectOverride?: string | null
 ) {
-  const model = getSetting("ANIMATION_MODEL") || undefined;
-  const aspectRatio = getSetting("IMAGE_RATIO") || undefined;
+  const model = (modelOverride && modelOverride.trim()) || getSetting("ANIMATION_MODEL") || undefined;
+  const aspectRatio = (aspectOverride && aspectOverride.trim()) || getSetting("IMAGE_RATIO") || undefined;
   const durationSetting = getSetting("ANIMATION_DURATION") || undefined;
   // ANIMATION_KEEP_VEO_AUDIO=1 — keep generated ambient audio (default: off, mute it).
   const keepAudio = getSetting("ANIMATION_KEEP_VEO_AUDIO") === "1";
 
-  // Motion style: preset override (per channel) wins over the global default.
-  // Empty/null override means "inherit global" — fall back to getPrompt().
-  const motionStyle =
-    motionOverride && motionOverride.trim().length > 0
-      ? motionOverride
-      : getPrompt("animation_motion");
-  const prompt = `${scene.visual_prompt}. ${motionStyle}`;
+  // Video style: per-channel override wins over the global VIDEO_STYLE setting.
+  // Empty/null override means "inherit global".
+  const videoStyle =
+    styleOverride && styleOverride.trim().length > 0
+      ? styleOverride
+      : getSetting("VIDEO_STYLE");
+  const prompt = videoStyle ? `${scene.visual_prompt}. ${videoStyle}` : scene.visual_prompt;
 
   // If the image was generated through 69labs, pass its jobId so the API
   // reuses the cached image instead of making us re-upload bytes.
@@ -140,7 +148,7 @@ async function labs69Img2Vid(
       log(
         runId,
         "debug",
-        `69labs video job ${jobId.slice(0, 8)}… (img2vid${usableJobId ? ", reusing image" : ", text-only"}, attempt=${attempt})`,
+        `69labs video job ${jobId.slice(0, 8)}… (${usableJobId ? "image-to-video keyframe" : "text-only"}, attempt=${attempt})`,
         { stage: "animate" }
       );
       checkCancelled(runId); // before polling

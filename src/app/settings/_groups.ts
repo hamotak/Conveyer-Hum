@@ -6,10 +6,10 @@
  * page renders that group.
  *
  * NOTE: only the settings relevant to Conveyer Hum's actual pipeline are
- * surfaced here. Legacy keys (image generation, ElevenLabs voice fine-tuning,
- * animation ratio/distribution) still exist in SETTING_KEYS / DEFAULTS so old
- * DB rows and code paths don't break — they're just hidden from the UI because
- * Conveyer Hum is video-only with MiniMax TTS and animates every scene.
+ * surfaced here. Less common keys (image model tuning, ElevenLabs voice
+ * fine-tuning, animation ratio/distribution) still exist in SETTING_KEYS /
+ * DEFAULTS so old DB rows and code paths don't break, but the main flow keeps
+ * the UI focused on simple channel presets.
  */
 
 export interface Field {
@@ -19,12 +19,18 @@ export interface Field {
   examples?: string;
   required?: boolean;
   multiline?: boolean;
+  /** When set, the field renders as a dropdown of these value/label pairs
+   *  instead of a free-text input. The stored value is always `value`. */
+  options?: { value: string; label: string }[];
 }
 
 export interface Group {
   title: string;
   subtitle?: string;
   required?: boolean;
+  /** When true, the group renders collapsed (inside a closed <details>) so
+   *  rarely-needed fields stay out of the way until expanded. */
+  collapsed?: boolean;
   fields: Field[];
 }
 
@@ -42,7 +48,7 @@ export const ALL_GROUPS: Group[] = [
       },
       {
         key: "LABS69_API_KEY",
-        desc: "One key for BOTH Grok video generation and MiniMax voiceover through 69labs.vip — no separate TTS account needed.\n\nPRO TIP: You can paste multiple keys from different 69labs accounts (one per line, or comma-separated). Each account adds another 5 parallel video jobs to the pool. With 3 keys, generation is roughly 3× faster. The platform automatically balances jobs across all keys.",
+        desc: "One key for BOTH video generation and ElevenLabs voiceover through 69labs.vip — no separate TTS account needed.\n\nPRO TIP: You can paste multiple keys from different 69labs accounts (one per line, or comma-separated). Each account adds another 5 parallel video jobs to the pool. With 3 keys, generation is roughly 3× faster. The platform automatically balances jobs across all keys.",
         examples: "Single key: vk_abc... · Multiple keys: paste each on its own line. Each starts with vk_",
         required: true,
         multiline: true,
@@ -82,68 +88,50 @@ export const ALL_GROUPS: Group[] = [
     ],
   },
   {
-    title: "Voice Over (TTS)",
-    subtitle: "Conveyer Hum narrates with MiniMax through the 69labs gateway — the same LABS69_API_KEY that powers video also covers the voiceover. Pick a MiniMax voice and tune its delivery here.",
+    // Voice + Video creative fields (voice id/tuning, model, style, aspect ratio)
+    // now live on each channel (and the New Run inline card). Only the technical
+    // engine/model settings stay here as global defaults.
+    title: "Voice engine",
+    subtitle: "Global voiceover engine + model. Pick the actual voice, speed and tuning on each channel (or the New Run page).",
     fields: [
       {
-        key: "TTS_VOICE_ID",
-        label: "MiniMax voice",
-        desc: "The MiniMax voice used for narration. Use a catalog voice id (e.g. English_Comedian) or a cloned-voice id — browse them in your 69labs dashboard → MiniMax. A channel profile in Channels & Prompts can override this per channel.",
-        examples: "Catalog voice e.g. English_Comedian  ·  or a cloned-voice id from 69labs",
+        key: "TTS_PROVIDER",
+        label: "TTS engine",
+        desc: "Which engine generates the voiceover. The recommended option runs ElevenLabs through your existing 69labs key — no extra account needed. The other options call ElevenLabs / OpenAI directly (each needs its own API key), or use the legacy engine.",
+        options: [
+          { value: "69labs", label: "ElevenLabs via 69labs (recommended — no extra key needed)" },
+          { value: "elevenlabs", label: "ElevenLabs direct (requires separate ElevenLabs API key)" },
+          { value: "openai", label: "OpenAI TTS (requires OpenAI key)" },
+          { value: "minimax", label: "MiniMax (legacy — direct MiniMax API)" },
+        ],
       },
       {
         key: "TTS_MODEL",
-        label: "MiniMax model",
-        desc: "Which MiniMax speech model to use. `speech-02-hd` is the highest-quality option and the recommended default. Leave it as-is unless 69labs lists a newer model.",
-        examples: "speech-02-hd (default — highest quality)",
-      },
-      {
-        key: "TTS_SPEED",
-        desc: "Speech rate. 1.0 = neutral pace. Lower = slower and more deliberate. 0.93 sounds slightly cinematic for documentary narration.",
-        examples: "Range 0.5–2.0  ·  default 0.93",
+        label: "ElevenLabs model",
+        desc: "eleven_multilingual_v2 is a good default. Other models from ElevenLabs may also work.",
+        examples: "eleven_multilingual_v2 (default)",
       },
       {
         key: "TTS_LANGUAGE_BOOST",
         label: "Language boost",
-        desc: "Tells MiniMax which language to optimise pronunciation for. Set it to your script's language for the clearest delivery. `auto` lets MiniMax detect the language itself.",
+        desc: "Tells the voice engine which language to optimise pronunciation for. `auto` lets the engine detect it.",
         examples: "English (default)  ·  Spanish  ·  French  ·  auto",
-      },
-      {
-        key: "TTS_PROVIDER",
-        desc: "Which engine generates the voiceover. `minimax` (default) routes to MiniMax via 69labs. `69labs` uses Edge TTS / ElevenLabs / a cloned voice through 69labs. `elevenlabs` and `openai` call those APIs directly and need their own keys.",
-        examples: "minimax (default)  ·  69labs  ·  elevenlabs  ·  openai",
       },
     ],
   },
   {
-    title: "Video Generation (Grok)",
-    subtitle: "How each scene's video clip is generated. Conveyer Hum animates EVERY scene through Grok via 69labs.",
+    title: "Video output",
+    subtitle: "Global video provider + audio. Each fresh scene is generated as image first, then image-to-video. Pick model, style and aspect ratio on each channel (or the New Run page).",
     fields: [
       {
         key: "ANIMATION_PROVIDER",
-        desc: "Service for video generation. `69labs` (default) routes to xAI Grok. `replicate` / `fal` open the door to Kling, Luma, etc. Do not set to `off` — Conveyer Hum is video-only and needs a provider.",
+        desc: "Service for image-to-video generation. `69labs` (default) routes to the chosen model. `replicate` / `fal` open the door to Kling, Luma, etc. Do not set to `off` — Conveyer Hum needs a video provider.",
         examples: "69labs  (default)  ·  replicate  ·  fal",
-      },
-      {
-        key: "ANIMATION_MODEL",
-        desc: "Specific model id. `grok-imagine-video` (xAI Grok) is the Conveyer Hum default — that's what this fork is built around. `veo-video` (Google Veo) is an alternate 69labs option. For Replicate use `kwaivgi/kling-v1.6-pro`.",
-        examples: "grok-imagine-video  (default)  ·  veo-video  ·  kwaivgi/kling-v1.6-standard",
-      },
-      {
-        key: "IMAGE_RATIO",
-        label: "Aspect ratio",
-        desc: "Aspect ratio of the generated video clips. 16:9 for landscape YouTube videos, 9:16 for vertical Shorts/Reels.",
-        examples: "16:9 (default)  ·  9:16  ·  1:1",
-      },
-      {
-        key: "ANIMATION_DURATION",
-        desc: "Clip length in seconds. IGNORED for Grok (69labs hard-blocks the duration parameter — Grok always returns a fixed ~6s clip) and Veo. Only used for other providers (Kling via Replicate/fal).",
-        examples: "empty = provider default  ·  4–10 = explicit (Kling/Replicate only)",
       },
       {
         key: "ANIMATION_KEEP_VEO_AUDIO",
         label: "Keep model ambient audio",
-        desc: "Whether to keep the ambient audio the video model bakes into each clip. Default empty — we mute it so only the MiniMax voiceover is heard. Set `1` to layer the model's atmospheric sound behind the narrator. (Key name is legacy — applies to any model.)",
+        desc: "Whether to keep the ambient audio the video model bakes into each clip. Default empty — we mute it so only the voiceover is heard. Set `1` to layer the model's atmospheric sound behind the narrator.",
         examples: "empty = mute (default)  ·  1 = keep ambient audio",
       },
     ],
@@ -154,7 +142,7 @@ export const ALL_GROUPS: Group[] = [
     fields: [
       {
         key: "VIDEO_RESOLUTION",
-        desc: "Final video resolution. 1920x1080 (1080p) is the YouTube standard. Grok source clips are scaled to fit.",
+        desc: "Final video resolution. 1920x1080 (1080p) is the YouTube standard. Source clips are scaled to fit.",
         examples: "1920x1080, 1280x720, 3840x2160",
       },
       {
@@ -167,16 +155,8 @@ export const ALL_GROUPS: Group[] = [
         desc: "Crossfade length between scenes in seconds. 0.5 is a gentle blend. 1.0 is more cinematic and smooths over short clips. 0 disables transitions (instant cuts — faster to render but abrupt).",
         examples: "0.5 = smooth  ·  1.0 = cinematic  ·  0 = no transitions",
       },
-      {
-        key: "SCENE_TAIL_SILENCE",
-        desc: "Silence appended to the END of every scene's audio before assembly. This is how you get breathing room BETWEEN scenes. Raise to 0.6–0.8 if narration feels rushed at sentence endings.",
-        examples: "0 = back-to-back  ·  0.4 = natural breath (default)  ·  0.8 = reflective pacing",
-      },
-      {
-        key: "SCENE_DURATION_SECONDS",
-        desc: "Fallback clip duration when TTS audio length is somehow unknown. In normal operation this is never used — we measure actual audio length with ffprobe.",
-        examples: "default 5",
-      },
+      // SCENE_TAIL_SILENCE removed from UI — deprecated: continuous-voiceover
+      // (one continuous audio track means there are no inter-scene gaps to pad).
     ],
   },
   {
@@ -222,17 +202,33 @@ export const ALL_GROUPS: Group[] = [
     ],
   },
   {
-    title: "Optional / Alternative Providers",
-    subtitle: "Only needed if you switch away from the default Grok + MiniMax stack. Leave empty otherwise.",
+    title: "Rarely needed",
+    subtitle: "Alternative providers and advanced fields most people never touch. Only matters if you switch away from the default Veo 3.1 + ElevenLabs stack, or use a non-69labs video model. Leave empty otherwise.",
+    collapsed: true,
     fields: [
       {
+        key: "IMAGE_PROVIDER",
+        desc: "Service for first-frame image keyframes. Keep this on `69labs` for the default flow so the generated image job can be chained directly into 69labs video generation.",
+        examples: "69labs (default)  ·  replicate  ·  openai  ·  fal",
+      },
+      {
+        key: "IMAGE_MODEL",
+        desc: "Image model used for the first frame of every generated scene. The default is tuned for 69labs image generation.",
+        examples: "nano-banana-pro  ·  imagen-4  ·  seedream-4.5",
+      },
+      {
+        key: "IMAGE_RESOLUTION",
+        desc: "Image keyframe resolution for models that support it. Higher can improve detail but costs more and may take longer.",
+        examples: "1k = default  ·  2k  ·  4k",
+      },
+      {
         key: "ELEVENLABS_API_KEY",
-        desc: "Direct ElevenLabs API key. Only used when TTS_PROVIDER is set to `elevenlabs`.",
+        desc: "Direct ElevenLabs API key. Only used when the TTS engine is set to `ElevenLabs direct`.",
         examples: "Sign up at https://elevenlabs.io → Profile → API Keys",
       },
       {
         key: "REPLICATE_API_TOKEN",
-        desc: "Replicate token — for using Kling or other video models directly instead of Grok via 69labs.",
+        desc: "Replicate token — for using Kling or other video models directly instead of the default 69labs model.",
         examples: "Sign up at https://replicate.com → Account → API Tokens",
       },
       {
@@ -247,8 +243,18 @@ export const ALL_GROUPS: Group[] = [
       },
       {
         key: "OPENAI_API_KEY",
-        desc: "OpenAI key — for backup TTS (gpt-4o-mini-tts) when TTS_PROVIDER is `openai`.",
+        desc: "OpenAI key — for backup TTS (gpt-4o-mini-tts) when the TTS engine is set to `OpenAI`.",
         examples: "Sign up at https://platform.openai.com",
+      },
+      {
+        key: "ANIMATION_DURATION",
+        desc: "Clip length in seconds. IGNORED by the 69labs models (Veo and Grok both return a fixed-length clip — 69labs hard-blocks the duration parameter). Only used for other providers (Kling via Replicate/fal).",
+        examples: "empty = provider default  ·  4–10 = explicit (Kling/Replicate only)",
+      },
+      {
+        key: "SCENE_DURATION_SECONDS",
+        desc: "Fallback clip duration when TTS audio length is somehow unknown. In normal operation this is never used — we measure actual audio length with ffprobe.",
+        examples: "default 5",
       },
     ],
   },

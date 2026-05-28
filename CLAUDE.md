@@ -3,6 +3,16 @@
 This file is auto-loaded by Claude Code. It gives you (Claude) the full picture
 of Conveyer Hum so you can confidently answer questions and make changes.
 
+## Required handoff memory
+
+Before doing project work, read `AI_HANDOFF.md` in the repo root. It contains
+the latest session notes, current verification state, tool/plugin assumptions,
+and what not to re-explain to the user.
+
+Before ending any substantial session, update `AI_HANDOFF.md` if you changed
+features, UI, tests, setup, commands, safety guidance, known bugs, or next
+steps. Keep it concise, dated, and never include full secrets or tokens.
+
 ---
 
 ## What Conveyer Hum is
@@ -12,7 +22,8 @@ user's machine (Next.js dev server + local SQLite + local FFmpeg) — no hosted
 backend. It has **two modes**, picked from the sidebar:
 
 1. **Video Conveyer** (`/`) — the full pipeline: paste a script → split into
-   scenes → ElevenLabs voiceover + Veo video per scene → assemble one MP4.
+   scenes → ElevenLabs voiceover + image keyframe + Veo image-to-video per
+   scene → assemble one MP4.
 2. **Re-assembly** (`/reassembly`) — hybrid build: AI matches script scenes to
    clips in the Google Drive library, the user swaps any pick, and only the
    missing scenes are generated fresh. It reuses the Video Conveyer pipeline
@@ -32,16 +43,18 @@ of Bull Network) use it and request features.
 - Forked from **Conveyer Grok** (lineage: Conveyer Isabell → Hum Conveyer →
   Conveyer Grok → Conveyer Hum). Conveyer Grok stays untouched as the base.
 - Conveyer Grok used **xAI Grok** for video (via 69labs) and **HeyGen** for TTS.
-- Conveyer Hum now defaults to **Veo 3.1 Fast** for video and **ElevenLabs** for
-  voiceover, both routed through 69labs — so a single `LABS69_API_KEY` covers
-  video + audio. **Grok** (fixed ~6s clips) and **MiniMax** TTS remain available
-  as legacy/alternative options, but neither is the default any more.
+- Conveyer Hum now defaults to **Veo 3.1 Fast** for image-to-video and
+  **ElevenLabs** for voiceover, both routed through 69labs — so a single
+  `LABS69_API_KEY` covers image keyframes + video + audio. **Grok** (fixed ~6s
+  clips) and **MiniMax** TTS remain available as legacy/alternative options,
+  but neither is the default any more.
 - Because of the fork lineage, some legacy names survive intentionally:
   - The DB column `prompt_presets.content` actually holds the scene_split prompt.
   - The setting key `ANIMATION_KEEP_VEO_AUDIO` applies to any model, not just Veo.
-  - The `image-gen.ts` service + `IMAGE_*` settings exist but are dead (the
-    pipeline is video-only). Don't delete them blindly — `IMAGE_RATIO` is still
-    read as the video aspect ratio.
+  - The `image-gen.ts` service + `IMAGE_*` settings are active again: each fresh
+    scene generates a still keyframe first, then chains that 69labs image job
+    into the video job for first-frame consistency. `IMAGE_RATIO` still doubles
+    as the video aspect ratio.
 
 ---
 
@@ -71,14 +84,19 @@ the background → redirects the UI to `/runs/[id]` which streams logs.
    `text`, `visual_prompt`, `duration_hint_sec`. The system prompt is the
    chosen channel profile's `scene_split`, else the global default.
 2. **Per scene, in parallel** (concurrency-limited via `plimit.ts`):
-   - `synthesizeScene()` (`services/tts.ts`) → narration MP3. Default provider
-     is 69labs with `TTS_VOICE_PROVIDER="elevenlabs"`; MiniMax via 69labs,
-     ElevenLabs (direct) and OpenAI stay available as alternatives via
-     `TTS_PROVIDER` / `TTS_VOICE_PROVIDER`.
-   - `animateScene()` (`services/img2vid.ts`) → silent video clip via Veo 3.1
-     Fast through 69labs (default). Grok (legacy, fixed ~6s clip) and Kling stay
+   - `synthesizeFullScript()` (`services/tts.ts`) → one continuous narration
+     MP3. Default provider is 69labs with `TTS_VOICE_PROVIDER="elevenlabs"`;
+     MiniMax via 69labs, ElevenLabs (direct) and OpenAI stay available as
+     alternatives via `TTS_PROVIDER` / `TTS_VOICE_PROVIDER`.
+   - `generateImage()` (`services/image-gen.ts`) → `images/scene_###.png`
+     keyframe via 69labs (default). The shared channel/video style is appended
+     to the image prompt for consistency.
+   - `animateScene()` (`services/img2vid.ts`) → image-to-video clip via Veo 3.1
+     Fast through 69labs (default), chained by `imageJobId` so the still image
+     anchors the first frame. Grok (legacy, fixed ~6s clip) and Kling stay
      available. OR, if the scene was marked for reuse, `downloadReusedClip()`
-     pulls an existing clip from Google Drive instead.
+     pulls an existing clip from Google Drive instead and skips new image/video
+     generation.
 3. **Per-scene render** — `services/video-assemble.ts` combines narration + clip
    into one MP4 per scene, matching durations (trim / stretch / pad).
 4. **Final assembly** — FFmpeg xfade-concatenates all scene clips → `final.mp4`.
@@ -95,7 +113,7 @@ Server-Sent Events (`/api/runs/[id]/logs`).
 | Service | Used for | Notes |
 |---|---|---|
 | **Google Gemini** | scene split | `GOOGLE_API_KEY`. Free tier fine. |
-| **69labs.vip** | Veo video (default; Grok legacy) + ElevenLabs voiceover (default; MiniMax alt) | `LABS69_API_KEY` (covers both). Multi-key supported (newline/comma separated). Each key = 5 parallel video jobs. |
+| **69labs.vip** | image keyframes + Veo image-to-video (default; Grok legacy) + ElevenLabs voiceover (default; MiniMax alt) | `LABS69_API_KEY` covers images, video, and audio. Multi-key supported (newline/comma separated). Each key = 7 parallel image jobs and 5 parallel video jobs. |
 | **ElevenLabs (via 69labs)** | TTS voiceover (default) | Default `TTS_PROVIDER="69labs"` + `TTS_VOICE_PROVIDER="elevenlabs"`. `TTS_VOICE_ID` = the voice id for the chosen provider. |
 | **MiniMax (via 69labs)** | TTS voiceover (alternative) | Set `TTS_VOICE_PROVIDER="minimax"`. MiniMax voice id is a catalog string e.g. `English_Comedian` (or a cloned voice). Model `speech-02-hd`. |
 | **Google Drive** | optional sync + reuse | OAuth2. The callback `redirect_uri` is derived from the live request origin (overridable via `APP_ORIGIN` / `NEXT_PUBLIC_APP_ORIGIN`), e.g. `http://localhost:3001/api/gdrive/oauth/callback` if Next picked port 3001 — NOT hardcoded to 3000. The Settings page shows the exact callback URL to register in Google Cloud. |
@@ -168,14 +186,15 @@ src/
     └── services/
         ├── scene-split.ts      script → Scene[] via Gemini/Claude
         ├── tts.ts              69labs (ElevenLabs default / MiniMax alt) / ElevenLabs / OpenAI TTS
-        ├── img2vid.ts          Veo (default) / Grok (legacy) / Kling video generation
+        ├── image-gen.ts        69labs/Replicate/OpenAI/fal image keyframes
+        ├── img2vid.ts          Veo (default) / Grok (legacy) / Kling image-to-video generation
         ├── labs69.ts           69labs client + multi-key pool + voice catalogs
         ├── video-assemble.ts   FFmpeg per-scene render + final xfade
+        ├── video-poster.ts     FFmpeg poster extraction for run-page previews
         ├── gdrive.ts           Google Drive client
         ├── run-upload.ts       upload a finished run to Drive
         ├── library.ts          AI clip-matching for reuse
-        ├── reuse.ts            download a reused clip from Drive
-        └── image-gen.ts        DEAD (video-only) — kept for legacy safety
+        └── reuse.ts            download a reused clip from Drive
 docs/                           INSTALL.md, USAGE.md, PROMPT-GUIDE.md
 scripts/
 ├── fix-native-binaries.mjs     postinstall — restore .node on Windows
@@ -256,4 +275,5 @@ still reference it for legacy safety.) Schema changes use `tryAddColumn()` in
   is disabled. The new **Re-assembly mode** (Mode 2) covers the real need:
   rebuild from the Drive clip library, not from local disk.
 
-See also: `docs/INSTALL.md`, `docs/USAGE.md`, `docs/PROMPT-GUIDE.md`, `README.md`.
+See also: `AI_HANDOFF.md`, `docs/INSTALL.md`, `docs/USAGE.md`,
+`docs/PROMPT-GUIDE.md`, `README.md`.

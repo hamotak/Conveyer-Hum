@@ -105,23 +105,32 @@ export default function LibraryPage() {
 
   return (
     <div>
-      <h1>Library</h1>
-      <p className="muted" style={{ marginBottom: 20, fontSize: 14, lineHeight: 1.6 }}>
-        Every run you&apos;ve saved to Google Drive. The AI uses this library to find clips it can
-        reuse when you start a new run with similar scenes.
+      <h1>Clip Library</h1>
+      <p className="muted" style={{ marginBottom: 20, fontSize: 13.5 }}>
+        Clips from past runs on Drive — reused automatically when a new script has similar scenes.
       </p>
 
-      {loading && <div className="muted">Loading…</div>}
+      {loading && (
+        <div className="row-list" aria-busy="true" aria-label="Loading library">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <div key={i} className="row-item" style={{ cursor: "default" }}>
+              <div style={{ flex: 1 }}>
+                <div className="skeleton skeleton-line" style={{ width: "42%", marginBottom: 8 }} />
+                <div className="skeleton skeleton-line" style={{ width: "24%", height: 9 }} />
+              </div>
+              <div className="skeleton skeleton-pill" style={{ width: 84 }} />
+            </div>
+          ))}
+        </div>
+      )}
 
       {!loading && drive && !drive.connected && (
-        <div className="card">
-          <h2 style={{ marginBottom: 6, color: "var(--warning)" }}>Google Drive not connected</h2>
-          <p className="muted" style={{ fontSize: 13, marginBottom: 12, lineHeight: 1.5 }}>
-            Connect your Google account in Settings — saved runs will appear here automatically.
+        <div className="empty-state">
+          <div className="empty-state-title">Connect Google Drive</div>
+          <p className="muted" style={{ fontSize: 13, margin: "6px 0 18px", lineHeight: 1.5 }}>
+            Saved runs appear here once Drive is connected.
           </p>
-          <a className="btn" href="/settings">
-            Open Settings →
-          </a>
+          <a className="btn" href="/settings">Open Settings</a>
         </div>
       )}
 
@@ -137,12 +146,12 @@ export default function LibraryPage() {
       )}
 
       {!loading && drive?.connected && !error && runs && runs.length === 0 && (
-        <div className="card">
-          <h2 style={{ marginBottom: 6 }}>Library is empty</h2>
-          <p className="muted" style={{ fontSize: 13, lineHeight: 1.5, margin: 0 }}>
-            Run the pipeline — finished runs auto-upload to Drive (if &quot;Auto-upload finished runs
-            to Drive&quot; is on in Settings). Each new run shows up here.
+        <div className="empty-state">
+          <div className="empty-state-title">Library is empty</div>
+          <p className="muted" style={{ fontSize: 13, margin: "6px 0 18px", lineHeight: 1.5 }}>
+            Finished runs auto-upload to Drive and show up here.
           </p>
+          <a className="btn" href="/">New video</a>
         </div>
       )}
 
@@ -201,13 +210,17 @@ export default function LibraryPage() {
                         )}
                       </div>
                     </div>
-                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                      <button
-                        className="btn-secondary btn-sm"
-                        onClick={() => setOpenRunId(isOpen ? null : r.drive_folder_id)}
-                      >
-                        {isOpen ? "Hide clips" : `View ${r.uploaded_clip_count} clips`}
-                      </button>
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                      {r.uploaded_clip_count > 0 ? (
+                        <button
+                          className="btn-secondary btn-sm"
+                          onClick={() => setOpenRunId(isOpen ? null : r.drive_folder_id)}
+                        >
+                          {isOpen ? "Hide clips" : `View ${r.uploaded_clip_count} clips`}
+                        </button>
+                      ) : (
+                        <span className="faint" style={{ fontSize: 12 }}>No reusable clips in this run</span>
+                      )}
                       <a
                         className="btn-secondary btn-sm"
                         href={r.drive_folder_link}

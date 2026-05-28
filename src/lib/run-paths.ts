@@ -26,16 +26,6 @@ export function getRunsRoot(): string {
   return custom && custom.length > 0 ? custom : path.join(DATA_DIR, "runs");
 }
 
-/**
- * Root for the standalone Voiceover tool's MP3 outputs (Tab 2).
- * Always `<DATA_DIR>/voiceovers/` — independent of RUNS_OUTPUT_DIR. Created on demand.
- */
-export function getVoiceoverDir(): string {
-  const dir = path.join(DATA_DIR, "voiceovers");
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  return dir;
-}
-
 const getFolderStmt = db.prepare("SELECT folder_name FROM runs WHERE id = ?");
 
 /** Absolute path to a specific run's folder. */

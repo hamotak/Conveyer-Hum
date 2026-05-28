@@ -40,6 +40,7 @@ export function ThemeToggle() {
   return (
     <button
       onClick={toggle}
+      className="sidebar-theme-toggle"
       title={isLight ? "Switch to dark theme" : "Switch to light theme"}
       aria-label="Toggle theme"
       style={{
@@ -91,7 +92,7 @@ export function ThemeToggle() {
           <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
         </svg>
       )}
-      {isLight ? "Dark theme" : "Light theme"}
+      <span className="sidebar-text">{isLight ? "Dark theme" : "Light theme"}</span>
     </button>
   );
 }
