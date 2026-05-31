@@ -36,27 +36,62 @@ interface GdriveStatus {
   credentialsConfigured: boolean;
 }
 
+interface LocalRun {
+  id: string;
+  title: string | null;
+  status: string;
+  created_at: string;
+  output_path: string | null;
+}
+
+async function fetchJsonWithTimeout<T>(url: string, timeoutMs = 6000): Promise<T> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    return (await response.json()) as T;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+function isAuditRun(run: LocalRun): boolean {
+  const title = (run.title || "").trim();
+  return title.startsWith("__AUDIT_") || /^__V\d+_/i.test(title) || /\bTEST\b/i.test(title);
+}
+
 export default function LibraryPage() {
+  const embedded = false;
   const [runs, setRuns] = useState<LibraryRun[] | null>(null);
+  const [localRuns, setLocalRuns] = useState<LocalRun[]>([]);
   const [drive, setDrive] = useState<GdriveStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [openRunId, setOpenRunId] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     let alive = true;
     (async () => {
       setLoading(true);
+      setError(null);
       try {
-        const driveR = await fetch("/api/gdrive/status").then((r) => r.json());
+        const [driveR, localR] = await Promise.all([
+          fetchJsonWithTimeout<GdriveStatus>("/api/gdrive/status", 4000),
+          fetchJsonWithTimeout<LocalRun[]>("/api/runs", 4000).catch(() => []),
+        ]);
         if (!alive) return;
         setDrive(driveR as GdriveStatus);
+        setLocalRuns(
+          (Array.isArray(localR) ? (localR as LocalRun[]) : [])
+            .filter((r) => r.status === "done" && r.output_path && !isAuditRun(r))
+        );
         if (!driveR.connected) {
           setRuns([]);
           return;
         }
-        const r = await fetch("/api/library/runs").then((r) => r.json());
+        const r = await fetchJsonWithTimeout<{ runs?: LibraryRun[]; error?: string }>("/api/library/runs", 3500);
         if (!alive) return;
         if (r.error) {
           setError(String(r.error));
@@ -65,7 +100,11 @@ export default function LibraryPage() {
           setRuns((r.runs ?? []) as LibraryRun[]);
         }
       } catch (e) {
-        if (alive) setError((e as Error).message);
+        if (alive) {
+          const timedOut = e instanceof DOMException && e.name === "AbortError";
+          setError(timedOut ? "Drive library is taking too long to respond. Local saved videos are still available." : (e as Error).message);
+          setRuns([]);
+        }
       } finally {
         if (alive) setLoading(false);
       }
@@ -73,20 +112,24 @@ export default function LibraryPage() {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [reloadKey]);
+
+  const reusableRuns = useMemo(() => {
+    if (!runs) return [];
+    return runs.filter((r) => r.uploaded_clip_count > 0 && r.clips.length > 0);
+  }, [runs]);
 
   const filtered = useMemo(() => {
-    if (!runs) return [];
     const q = query.trim().toLowerCase();
-    if (!q) return runs;
-    return runs.filter((r) => {
+    if (!q) return reusableRuns;
+    return reusableRuns.filter((r) => {
       const inTitle = (r.run_title || r.folder_name).toLowerCase().includes(q);
       const inClips = r.clips.some(
         (c) => c.scene_text.toLowerCase().includes(q) || c.visual_prompt.toLowerCase().includes(q)
       );
       return inTitle || inClips;
     });
-  }, [runs, query]);
+  }, [reusableRuns, query]);
 
   // Group runs by channel — channels alphabetical, "_No Channel" last.
   const grouped = useMemo(() => {
@@ -105,57 +148,129 @@ export default function LibraryPage() {
 
   return (
     <div>
-      <h1>Clip Library</h1>
-      <p className="muted" style={{ marginBottom: 20, fontSize: 13.5 }}>
-        Clips from past runs on Drive — reused automatically when a new script has similar scenes.
-      </p>
+      {!embedded && (
+        <>
+          <h1>Saved Videos</h1>
+          <p className="muted" style={{ marginBottom: 20, fontSize: 13.5 }}>
+            Finished videos on this Mac first. Drive uploads and reusable scene clips appear below when connected.
+          </p>
+        </>
+      )}
+
+      {localRuns.length > 0 && (
+        <div style={{ marginBottom: 22 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+            <h2 style={{ margin: 0 }}>On this Mac</h2>
+            <span className="badge badge-neutral">
+              {localRuns.length} video{localRuns.length === 1 ? "" : "s"}
+            </span>
+          </div>
+          <div className="row-list">
+            {localRuns.map((r) => (
+              <div
+                key={r.id}
+                className="row-item"
+                role="link"
+                tabIndex={0}
+                onClick={() => {
+                  window.location.href = `/runs/${r.id}`;
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    window.location.href = `/runs/${r.id}`;
+                  }
+                }}
+              >
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div className="row-title">{r.title || r.id.slice(0, 8)}</div>
+                  <div className="faint" style={{ fontSize: 12, marginTop: 2 }}>
+                    {new Date(r.created_at.endsWith("Z") ? r.created_at : `${r.created_at}Z`).toLocaleString()}
+                  </div>
+                </div>
+                <a
+                  className="btn-secondary btn-sm"
+                  href={`/api/runs/${r.id}/file?p=final.mp4&download=1`}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  Download
+                </a>
+                <span aria-hidden="true" className="row-chevron">›</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {loading && (
-        <div className="row-list" aria-busy="true" aria-label="Loading library">
-          {Array.from({ length: 4 }).map((_, i) => (
-            <div key={i} className="row-item" style={{ cursor: "default" }}>
-              <div style={{ flex: 1 }}>
-                <div className="skeleton skeleton-line" style={{ width: "42%", marginBottom: 8 }} />
-                <div className="skeleton skeleton-line" style={{ width: "24%", height: 9 }} />
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "4px 0 10px" }}>
+            <h2 style={{ margin: 0 }}>Drive library</h2>
+            <span className="badge badge-neutral">loading</span>
+          </div>
+          <div className="row-list" aria-busy="true" aria-label="Loading library">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <div key={i} className="row-item" style={{ cursor: "default" }}>
+                <div style={{ flex: 1 }}>
+                  <div className="skeleton skeleton-line" style={{ width: "42%", marginBottom: 8 }} />
+                  <div className="skeleton skeleton-line" style={{ width: "24%", height: 9 }} />
+                </div>
+                <div className="skeleton skeleton-pill" style={{ width: 84 }} />
               </div>
-              <div className="skeleton skeleton-pill" style={{ width: 84 }} />
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
       )}
 
       {!loading && drive && !drive.connected && (
-        <div className="empty-state">
+        <div className={localRuns.length > 0 ? "card" : "empty-state"}>
           <div className="empty-state-title">Connect Google Drive</div>
           <p className="muted" style={{ fontSize: 13, margin: "6px 0 18px", lineHeight: 1.5 }}>
-            Saved runs appear here once Drive is connected.
+            Drive adds cloud backups and reusable scene clips. Local finished videos still work above.
           </p>
           <a className="btn" href="/settings">Open Settings</a>
         </div>
       )}
 
       {!loading && drive?.connected && error && (
-        <div className="card" style={{ borderColor: "rgba(248,113,113,0.35)", marginBottom: 12 }}>
-          <div style={{ color: "var(--danger)", fontWeight: 600, fontSize: 13 }}>
-            Couldn&apos;t load library
+        <div
+          className="card"
+          style={{
+            borderColor: "rgba(252,211,77,0.35)",
+            background: "var(--warning-soft)",
+            marginBottom: 16,
+            display: "flex",
+            alignItems: "flex-start",
+            justifyContent: "space-between",
+            gap: 12,
+            flexWrap: "wrap",
+          }}
+        >
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div style={{ color: "var(--warning)", fontWeight: 750, fontSize: 13 }}>
+              Drive library paused
+            </div>
+            <div style={{ color: "var(--fg-muted)", fontSize: 12.5, lineHeight: 1.55, marginTop: 4 }}>
+              {error}
+            </div>
           </div>
-          <div className="mono" style={{ color: "var(--fg-muted)", fontSize: 11, marginTop: 6, whiteSpace: "pre-wrap" }}>
-            {error}
-          </div>
+          <button type="button" className="btn-secondary btn-sm" onClick={() => setReloadKey((n) => n + 1)}>
+            Retry
+          </button>
         </div>
       )}
 
-      {!loading && drive?.connected && !error && runs && runs.length === 0 && (
+      {!loading && drive?.connected && !error && runs && reusableRuns.length === 0 && localRuns.length === 0 && (
         <div className="empty-state">
-          <div className="empty-state-title">Library is empty</div>
+          <div className="empty-state-title">No saved videos yet</div>
           <p className="muted" style={{ fontSize: 13, margin: "6px 0 18px", lineHeight: 1.5 }}>
-            Finished runs auto-upload to Drive and show up here.
+            Finished Drive uploads with reusable scene clips appear here. Empty or test-only folders stay hidden.
           </p>
           <a className="btn" href="/">New video</a>
         </div>
       )}
 
-      {!loading && drive?.connected && runs && runs.length > 0 && (
+      {!loading && drive?.connected && runs && reusableRuns.length > 0 && (
         <>
           <div style={{ marginBottom: 14, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
             <input
@@ -166,9 +281,9 @@ export default function LibraryPage() {
               style={{ maxWidth: 380, flex: 1 }}
             />
             <span className="muted" style={{ fontSize: 13 }}>
-              {filtered.length === runs.length
-                ? `${runs.length} run${runs.length === 1 ? "" : "s"}`
-                : `${filtered.length} of ${runs.length} runs`}
+              {filtered.length === reusableRuns.length
+                ? `${reusableRuns.length} run${reusableRuns.length === 1 ? "" : "s"}`
+                : `${filtered.length} of ${reusableRuns.length} runs`}
             </span>
           </div>
 

@@ -19,6 +19,9 @@ export interface ImageResult {
 export interface ImageOptions {
   /** Optional per-channel style override appended to the image prompt. */
   styleOverride?: string | null;
+  /** Stock/detail flows can opt out of the broad global image prompt when the
+   * user's exact prompt needs to stay fully in control. */
+  omitGlobalImagePrompt?: boolean;
   /** Per-channel aspect ratio — NULL → global IMAGE_RATIO. */
   aspectOverride?: string | null;
   /** Visual-continuity hint from the previous scene — appended to anchor the
@@ -38,7 +41,7 @@ export async function generateImage(
 ): Promise<ImageResult> {
   const configuredProvider = (getSetting("IMAGE_PROVIDER") || "69labs").toLowerCase();
   const provider = configuredProvider === "off" ? "69labs" : configuredProvider;
-  const styleSuffix = getPrompt("image_prompt");
+  const styleSuffix = options.omitGlobalImagePrompt ? "" : getPrompt("image_prompt");
   const styleOverride = options.styleOverride?.trim();
   const continuitySuffix = options.continuitySuffix?.trim();
   const finalPrompt = [scene.visual_prompt, continuitySuffix, styleSuffix, styleOverride]

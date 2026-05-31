@@ -3,32 +3,42 @@ import fs from "node:fs";
 import db from "./db";
 import { log } from "./logger";
 import { getSetting } from "./settings";
+import { resolveHybridFreshMinutes } from "./channel-stock";
 import { getRunDir } from "./run-paths";
 import { pLimit } from "./plimit";
-import { splitScript, type Scene } from "./services/scene-split";
-import { synthesizeFullScript } from "./services/tts";
+import { splitHybridScript, splitScript, type Scene } from "./services/scene-split";
+import { synthesizeFullScript, synthesizeScene, synthesizeContinuous } from "./services/tts";
 import { generateImage } from "./services/image-gen";
 import { animateScene } from "./services/img2vid";
 import {
   assembleContinuous,
+  assembleHybrid,
+  assembleTail,
   kenBurnsBufferFromClip,
   probeDurationSafe,
   type AssembleInput,
   type AssemblyClip,
+  type SceneAVItem,
 } from "./services/video-assemble";
+import { cacheStockLibrary } from "./services/stock-library";
+import { createShuffledStockDeckPicker } from "./stock-relevance";
 import { ensureVideoPoster } from "./services/video-poster";
-import { getKeyCount } from "./services/labs69";
+import { discoverLabs69Runtime } from "./services/labs69";
+import { effectiveProviderSlots } from "./services/labs69-capacity";
 import { syncRunToDrive, channelFolderName } from "./services/run-upload";
 import { downloadReusedClip } from "./services/reuse";
 import { findSimilarClips } from "./services/library";
 import { checkCancelled, clearCancelled, CancelledError } from "./cancellation";
 import { loadStylePreset } from "./style-presets";
+import { normalizeNarrationScenes } from "./scene-chunking";
+import { analyzeScenePlan } from "./scene-plan-health";
+import { archiveMediaForScenePlanChange } from "./repair-archive";
 import { isContinuityMode, lastFramePath, planContinuity, type ContinuityMode, type ContinuityStep } from "./continuity";
 import { extractLastFrame } from "./services/frame-extract";
 
 const getReuseMapStmt = db.prepare("SELECT reuse_map_json FROM runs WHERE id = ?");
 const getPresetSnapshotStmt = db.prepare(
-  "SELECT preset_animation_motion, preset_voice_id, preset_name, preset_video_style, preset_voice_speed, preset_voice_provider, preset_style_preset_id, preset_video_model, preset_aspect_ratio, preset_voice_stability, preset_voice_similarity_boost, preset_voice_style FROM runs WHERE id = ?"
+  "SELECT preset_animation_motion, preset_voice_id, preset_name, preset_video_style, preset_voice_speed, preset_voice_provider, preset_style_preset_id, preset_video_model, preset_aspect_ratio, preset_voice_stability, preset_voice_similarity_boost, preset_voice_style, preset_stock_folder, preset_hybrid_fresh_minutes FROM runs WHERE id = ?"
 );
 const getRunRowStmt = db.prepare("SELECT id, script FROM runs WHERE id = ?");
 const getRunConfigStmt = db.prepare("SELECT config_json FROM runs WHERE id = ?");
@@ -36,15 +46,133 @@ const getRunConfigStmt = db.prepare("SELECT config_json FROM runs WHERE id = ?")
 const updateRun = db.prepare(
   "UPDATE runs SET status = ?, output_path = ?, updated_at = datetime('now') WHERE id = ?"
 );
+const getRunStatusStmt = db.prepare("SELECT status FROM runs WHERE id = ?");
+
+const activeRunWorkers = new Set<string>();
+const WORKER_STALE_MS = 2 * 60 * 1000;
+
+function workerHeartbeatPath(runId: string): string {
+  return path.join(getRunDir(runId), ".worker-active.json");
+}
+
+function touchWorkerHeartbeat(runId: string) {
+  try {
+    const runDir = getRunDir(runId);
+    fs.mkdirSync(runDir, { recursive: true });
+    fs.writeFileSync(workerHeartbeatPath(runId), JSON.stringify({ runId, ts: Date.now() }), "utf-8");
+  } catch {
+    /* heartbeat is best-effort; the worker still owns the actual run */
+  }
+}
+
+function removeWorkerHeartbeat(runId: string) {
+  try {
+    fs.rmSync(workerHeartbeatPath(runId), { force: true });
+  } catch {
+    /* ignore */
+  }
+}
+
+function hasFreshWorkerHeartbeat(runId: string): boolean {
+  try {
+    return Date.now() - fs.statSync(workerHeartbeatPath(runId)).mtimeMs < WORKER_STALE_MS;
+  } catch {
+    return false;
+  }
+}
+
+function hasRecentRunFiles(runId: string): boolean {
+  const runDir = getRunDir(runId);
+  const cutoff = Date.now() - WORKER_STALE_MS;
+  const dirs = [runDir, path.join(runDir, "audio"), path.join(runDir, "clips"), path.join(runDir, "tail-clips")];
+  for (const dir of dirs) {
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(dir);
+      if (fs.statSync(dir).mtimeMs >= cutoff) return true;
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      try {
+        if (fs.statSync(path.join(dir, entry)).mtimeMs >= cutoff) return true;
+      } catch {
+        /* file may disappear between readdir/stat */
+      }
+    }
+  }
+  return false;
+}
+
+export function isRunWorkerActive(runId: string): boolean {
+  return activeRunWorkers.has(runId) || hasFreshWorkerHeartbeat(runId) || hasRecentRunFiles(runId);
+}
+
+function startRunWorker(runId: string, work: () => Promise<void>): { started: boolean; active: boolean } {
+  const statusRow = getRunStatusStmt.get(runId) as { status?: string } | undefined;
+  const status = statusRow?.status;
+  if (
+    activeRunWorkers.has(runId) ||
+    hasFreshWorkerHeartbeat(runId) ||
+    ((status === "running" || status === "pending") && hasRecentRunFiles(runId))
+  ) {
+    return { started: false, active: true };
+  }
+  activeRunWorkers.add(runId);
+  touchWorkerHeartbeat(runId);
+  const heartbeat = setInterval(() => touchWorkerHeartbeat(runId), 5000);
+  work()
+    .catch((e) => {
+      const msg = e instanceof Error ? e.message : String(e);
+      log(runId, "error", `Background worker crashed: ${msg}`, { stage: "pipeline" });
+      updateRun.run("error", null, runId);
+    })
+    .finally(() => {
+      clearInterval(heartbeat);
+      activeRunWorkers.delete(runId);
+      removeWorkerHeartbeat(runId);
+    });
+  return { started: true, active: true };
+}
+
+export function startRunPipeline(runId: string, script: string): { started: boolean; active: boolean } {
+  return startRunWorker(runId, () => runPipeline(runId, script));
+}
+
+export function startResumeRun(runId: string): { started: boolean; active: boolean } {
+  return startRunWorker(runId, () => resumeRun(runId));
+}
 
 /** scene index → padded video file path on disk. */
 function videoPathFor(animDir: string, index: number): string {
   return path.join(animDir, `scene_${String(index).padStart(3, "0")}.mp4`);
 }
+
+function videoManifestPath(videoPath: string): string {
+  return videoPath.replace(/\.mp4$/i, ".manifest.json");
+}
+
 /** True only if the file exists AND is non-empty (guards against broken/0-byte files). */
 function fileReady(p: string): boolean {
   try {
     return fs.statSync(p).size > 0;
+  } catch {
+    return false;
+  }
+}
+
+function generatedVideoReady(videoPath: string): boolean {
+  if (!fileReady(videoPath)) return false;
+  try {
+    const manifest = JSON.parse(fs.readFileSync(videoManifestPath(videoPath), "utf-8")) as Record<string, unknown>;
+    const cleanup = manifest.cleanup as Record<string, unknown> | undefined;
+    const cleanupStatus = typeof cleanup?.status === "string" ? cleanup.status : "";
+    return (
+      manifest.sourceMode === "image-to-video" &&
+      manifest.target === path.basename(videoPath) &&
+      cleanupStatus !== "failed" &&
+      cleanupStatus !== "missing"
+    );
   } catch {
     return false;
   }
@@ -72,6 +200,8 @@ function readPresetSnapshot(runId: string): {
   voiceStyleOverride: number | null;
   modelOverride: string | null;
   aspectOverride: string | null;
+  stockFolderOverride: string | null;
+  freshMinutesOverride: number | null;
 } {
   const row = getPresetSnapshotStmt.get(runId) as
     | {
@@ -87,6 +217,8 @@ function readPresetSnapshot(runId: string): {
         preset_voice_stability: number | null;
         preset_voice_similarity_boost: number | null;
         preset_voice_style: number | null;
+        preset_stock_folder: string | null;
+        preset_hybrid_fresh_minutes: number | null;
       }
     | undefined;
 
@@ -109,12 +241,16 @@ function readPresetSnapshot(runId: string): {
       voiceStyleOverride: null,
       modelOverride: null,
       aspectOverride: null,
+      stockFolderOverride: null,
+      freshMinutesOverride: null,
     };
   }
 
   return {
     scenePrompt: preset.sceneSplitPrompt,
     presetName: row?.preset_name ?? null,
+    stockFolderOverride: row?.preset_stock_folder ?? null,
+    freshMinutesOverride: row?.preset_hybrid_fresh_minutes ?? null,
     // video_style supersedes the legacy animation_motion snapshot; preset fills blanks.
     styleOverride: row?.preset_video_style ?? row?.preset_animation_motion ?? preset.defaults.videoStyle,
     voiceOverride: row?.preset_voice_id ?? null,
@@ -205,20 +341,43 @@ async function applyAutoReuse(
   }
 }
 
-/** Per-key × key-count concurrency limiters for TTS and video. */
-function makeLimiters() {
-  const keyCount = Math.max(1, getKeyCount());
-  const imagePerKey = Math.max(1, Number(getSetting("IMAGE_CONCURRENCY") || "5"));
-  const ttsPerKey = Math.max(1, Number(getSetting("TTS_CONCURRENCY") || "3"));
-  const animPerKey = Math.max(1, Number(getSetting("ANIMATION_CONCURRENCY") || "3"));
+/** Provider-aware concurrency limiters for TTS, images, and video. */
+async function makeLimiters(runId: string) {
+  const caps = await discoverLabs69Runtime();
+  const keyCount = Math.max(1, caps.keyCount);
+  const imagePerKey = effectiveProviderSlots(getSetting("IMAGE_CONCURRENCY"), caps.imagePerKey, 7);
+  const ttsPerKey = effectiveProviderSlots(getSetting("TTS_CONCURRENCY"), caps.ttsPerKey, 3);
+  const animPerKey = effectiveProviderSlots(getSetting("ANIMATION_CONCURRENCY"), caps.videoPerKey, 5);
+  const imageSlots = Math.max(20, imagePerKey * keyCount);
+  const ttsSlots = ttsPerKey * keyCount;
+  const animSlots = Math.max(5, animPerKey * keyCount);
+  log(
+    runId,
+    "info",
+    `69labs capacity: ${keyCount} key${keyCount === 1 ? "" : "s"} · image ${imageSlots} slots · video ${animSlots} slots · TTS ${ttsSlots} slots (${caps.source})`,
+    {
+      stage: "pipeline",
+      data: {
+        keyCount,
+        imageSlots,
+        videoSlots: animSlots,
+        ttsSlots,
+        imageRemainingMonthly: caps.imageRemainingMonthly,
+        videoRemainingMonthly: caps.videoRemainingMonthly,
+      },
+    }
+  );
   return {
     keyCount,
     imagePerKey,
     ttsPerKey,
     animPerKey,
-    limitImage: pLimit(imagePerKey * keyCount),
-    limitTts: pLimit(ttsPerKey * keyCount),
-    limitAnim: pLimit(animPerKey * keyCount),
+    imageSlots,
+    ttsSlots,
+    animSlots,
+    limitImage: pLimit(imageSlots),
+    limitTts: pLimit(ttsSlots),
+    limitAnim: pLimit(animSlots),
   };
 }
 
@@ -342,7 +501,9 @@ async function buildAssemblyClips(
   sceneVideos: { scene: Scene; videoPath: string }[],
   audioDuration: number,
   videoOpts: VideoOpts,
-  animDir: string
+  imageDir: string,
+  animDir: string,
+  limiters: MediaLimiters
 ): Promise<AssemblyClip[]> {
   const ordered = [...sceneVideos].sort((a, b) => a.scene.index - b.scene.index);
   const wc = (t: string) => t.trim().split(/\s+/).filter(Boolean).length || 1;
@@ -377,8 +538,16 @@ async function buildAssemblyClips(
     duration_hint_sec: 8,
   };
   try {
-    log(runId, "info", "buffer clip (audio coverage)", { stage: "animate" });
-    const bufPath = await animateScene(runId, bufferScene, null, animDir, videoOpts);
+    log(runId, "info", "buffer clip (image-to-video audio coverage)", { stage: "animate" });
+    const bufPath = await generateSceneVideoFromImage(
+      runId,
+      bufferScene,
+      imageDir,
+      animDir,
+      videoOpts,
+      limiters,
+      null
+    );
     if (!bufPath) throw new Error("buffer clip returned no path");
     clips.push({ path: bufPath, targetSec: null });
   } catch (e) {
@@ -411,6 +580,25 @@ async function finishRunContinuous(
   checkCancelled(runId);
   const finalPath = await assembleContinuous(runId, assemblyClips, audioPath, runDir);
   try {
+    const finalSec = await probeDurationSafe(finalPath);
+    fs.writeFileSync(
+      path.join(runDir, "sync-report.json"),
+      JSON.stringify(
+        {
+          mode: "continuous",
+          sceneCount: sceneVideos.length,
+          totalSec: finalSec,
+          voiceoverSec: audioDuration,
+          totalDriftSec: Math.abs(finalSec - audioDuration),
+          continuousVoiceover: true,
+        },
+        null,
+        2
+      ),
+      "utf-8"
+    );
+  } catch {}
+  try {
     await ensureVideoPoster(finalPath, path.join(runDir, "final-poster.jpg"));
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -430,12 +618,16 @@ async function finishRunContinuous(
     audio: { filePath: audioPath, durationSec: perClip },
   }));
   try {
+    checkCancelled(runId);
     await syncRunToDrive(runId, assets, runDir, finalPath);
+    checkCancelled(runId);
   } catch (e) {
+    if (e instanceof CancelledError) throw e;
     const msg = e instanceof Error ? e.message : String(e);
     log(runId, "warn", `Drive sync failed (local files preserved): ${msg}`, { stage: "gdrive" });
   }
 
+  checkCancelled(runId);
   updateRun.run("done", finalPath, runId);
   log(runId, "success", "Pipeline complete", { stage: "pipeline", data: { finalPath } });
 }
@@ -457,6 +649,19 @@ function handlePipelineError(runId: string, e: unknown): void {
 // ───────────────────────────────────────────────────────────────────────────
 
 export async function runPipeline(runId: string, script: string) {
+  // Per-run mode (full | hybrid | stock) routes through the sync-correct hybrid
+  // pipeline. Legacy: the global HYBRID_MODE toggle still works for old runs.
+  const cfgRow = getRunConfigStmt.get(runId) as { config_json: string | null } | undefined;
+  let runMode: string | undefined;
+  if (cfgRow?.config_json) {
+    try {
+      runMode = (JSON.parse(cfgRow.config_json) as { mode?: string }).mode;
+    } catch {}
+  }
+  if (runMode === "full" || runMode === "hybrid" || runMode === "stock" || (getSetting("HYBRID_MODE") || "") === "1") {
+    return runHybridPipeline(runId, script);
+  }
+
   const runDir = getRunDir(runId);
   const imageDir = path.join(runDir, "images");
   const animDir = path.join(runDir, "animations");
@@ -526,11 +731,11 @@ export async function runPipeline(runId: string, script: string) {
     // 3. Continuous voiceover: ONE TTS call for the whole script, plus one video
     //    per scene — generated in parallel. One audio call = one consistent voice
     //    and no inter-scene seams.
-    const { keyCount, imagePerKey, ttsPerKey, animPerKey, limitImage, limitTts, limitAnim } = makeLimiters();
+    const { keyCount, imagePerKey, ttsPerKey, animPerKey, imageSlots, ttsSlots, animSlots, limitImage, limitTts, limitAnim } = await makeLimiters(runId);
     log(
       runId,
       "info",
-      `Generating: 1 continuous voiceover + ${scenes.length} image keyframes + ${scenes.length} image-to-video clips. Keys: ${keyCount} · Concurrency per key×keys: image=${imagePerKey}×${keyCount}, TTS=${ttsPerKey}×${keyCount}, video=${animPerKey}×${keyCount}. Provider: ${animProvider}`,
+      `Generating: 1 continuous voiceover + ${scenes.length} image keyframes + ${scenes.length} image-to-video clips. Keys: ${keyCount} · image=${imageSlots} (${imagePerKey}/key), TTS=${ttsSlots} (${ttsPerKey}/key), video=${animSlots} (${animPerKey}/key). Provider: ${animProvider}`,
       { stage: "pipeline" }
     );
 
@@ -586,7 +791,10 @@ export async function runPipeline(runId: string, script: string) {
     enforceFailureThreshold(runId, scenes.length, sceneVideos.length);
     if (sceneVideos.length === 0) throw new Error("No scenes succeeded");
 
-    const assemblyClips = await buildAssemblyClips(runId, sceneVideos, audio.durationSec, videoOpts, animDir);
+    const assemblyClips = await buildAssemblyClips(runId, sceneVideos, audio.durationSec, videoOpts, imageDir, animDir, {
+      limitImage,
+      limitAnim,
+    });
     await finishRunContinuous(runId, assemblyClips, sceneVideos, audio.filePath, audio.durationSec, runDir);
   } catch (e) {
     handlePipelineError(runId, e);
@@ -606,6 +814,20 @@ export async function runPipeline(runId: string, script: string) {
  * no longer throws away clips already paid for.
  */
 export async function resumeRun(runId: string) {
+  const row = getRunRowStmt.get(runId) as { id: string; script: string } | undefined;
+  if (!row) throw new Error("Run not found");
+  const cfgRow = getRunConfigStmt.get(runId) as { config_json: string | null } | undefined;
+  let mode: string | undefined;
+  if (cfgRow?.config_json) {
+    try {
+      mode = (JSON.parse(cfgRow.config_json) as { mode?: string }).mode;
+    } catch {}
+  }
+  // Hybrid / stock / full (modern path) — resume without re-splitting scenes.
+  if (mode === "hybrid" || mode === "stock" || mode === "full") {
+    return runHybridPipeline(runId, row.script, { reuseScenes: true });
+  }
+
   const runDir = getRunDir(runId);
   const imageDir = path.join(runDir, "images");
   const animDir = path.join(runDir, "animations");
@@ -670,7 +892,7 @@ export async function resumeRun(runId: string) {
       { stage: "pipeline" }
     );
 
-    const { limitImage, limitTts, limitAnim } = makeLimiters();
+    const { limitImage, limitTts, limitAnim } = await makeLimiters(runId);
 
     // Audio: reuse the continuous track if present, else synthesize it once (retry once).
     const fullScript = scenes.map((s) => s.text).join(" ");
@@ -694,7 +916,7 @@ export async function resumeRun(runId: string) {
         try {
           checkCancelled(runId);
           const vPath = videoPathFor(animDir, scene.index);
-          if (fileReady(vPath)) return { scene, videoPath: vPath };
+          if (generatedVideoReady(vPath)) return { scene, videoPath: vPath };
           const reuseFileId = reuseMap[String(scene.index)];
           const generated = reuseFileId
             ? await downloadReusedClip(runId, scene, reuseFileId, animDir)
@@ -718,8 +940,315 @@ export async function resumeRun(runId: string) {
     enforceFailureThreshold(runId, scenes.length, sceneVideos.length);
     if (sceneVideos.length === 0) throw new Error("No scenes succeeded");
 
-    const assemblyClips = await buildAssemblyClips(runId, sceneVideos, audio.durationSec, videoOpts, animDir);
+    const assemblyClips = await buildAssemblyClips(runId, sceneVideos, audio.durationSec, videoOpts, imageDir, animDir, {
+      limitImage,
+      limitAnim,
+    });
     await finishRunContinuous(runId, assemblyClips, sceneVideos, audio.filePath, audio.durationSec, runDir);
+  } catch (e) {
+    handlePipelineError(runId, e);
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Hybrid run — fresh AI opening + narration-aware stock-library tail, per-scene audio
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Hybrid pipeline for long sleep videos:
+ *  - Every scene gets its OWN narration mp3 (per-scene audio = perfect sync).
+ *  - The first HYBRID_FRESH_MINUTES of narration get freshly generated AI clips
+ *    (image → video), the topical, synced opening.
+ *  - Every later scene is filled from the Drive stock library
+ *    (STOCK_LIBRARY_FOLDER, e.g. "Pirates"), ordered against the narration when
+ *    local clip names contain useful hints — no generation, no extra tokens.
+ *  - Assembly fits each clip to its scene's narration → zero audio/video drift.
+ */
+export async function runHybridPipeline(runId: string, script: string, opts?: { reuseScenes?: boolean }) {
+  const runDir = getRunDir(runId);
+  const imageDir = path.join(runDir, "images");
+  const animDir = path.join(runDir, "animations");
+  const audioDir = path.join(runDir, "audio");
+  for (const d of [runDir, imageDir, animDir, audioDir]) fs.mkdirSync(d, { recursive: true });
+
+  try {
+    clearCancelled(runId);
+    updateRun.run("running", null, runId);
+
+    const {
+      scenePrompt,
+      styleOverride,
+      voiceOverride,
+      speedOverride,
+      voiceProviderOverride,
+      stabilityOverride,
+      similarityOverride,
+      voiceStyleOverride,
+      modelOverride,
+      aspectOverride,
+      stockFolderOverride,
+      freshMinutesOverride,
+    } = readPresetSnapshot(runId);
+
+    // Mode (full | hybrid | stock) from the run config; stock folder + fresh
+    // minutes come from the channel (overrides) before the global default.
+    const cfgRow = getRunConfigStmt.get(runId) as { config_json: string | null } | undefined;
+    let mode: "full" | "hybrid" | "stock" = "hybrid";
+    if (cfgRow?.config_json) {
+      try {
+        const m = (JSON.parse(cfgRow.config_json) as { mode?: string }).mode;
+        if (m === "full" || m === "stock") mode = m;
+      } catch {}
+    }
+    const stockFolder = (stockFolderOverride || getSetting("STOCK_LIBRARY_FOLDER") || "Pirates").trim() || "Pirates";
+    const freshMinutes =
+      mode === "full"
+        ? 1e9
+        : mode === "stock"
+          ? 0
+          : Math.max(1, freshMinutesOverride ?? resolveHybridFreshMinutes(null, getSetting("HYBRID_FRESH_MINUTES")));
+    log(
+      runId,
+      "info",
+      `${mode} run · ${mode === "hybrid" ? `${freshMinutes} min fresh + ` : mode === "full" ? "all fresh, " : "all "}stock "${stockFolder}" · folder: ${path.basename(runDir)}`,
+      { stage: "pipeline" }
+    );
+    const ttsOpts = {
+      voiceOverride,
+      speedOverride,
+      voiceProviderOverride,
+      stabilityOverride,
+      similarityOverride,
+      voiceStyleOverride,
+    };
+    const videoOpts: VideoOpts = { styleOverride, modelOverride, aspectOverride };
+
+    // 1. Split the script — or reuse scenes.json on resume (skip expensive re-split).
+    const scenesPath = path.join(runDir, "scenes.json");
+    let scenes: Scene[];
+    let reuseSavedAssets = !!opts?.reuseScenes;
+    if (opts?.reuseScenes && fileReady(scenesPath)) {
+      const savedScenes = JSON.parse(fs.readFileSync(scenesPath, "utf-8")) as Scene[];
+      if (!Array.isArray(savedScenes) || savedScenes.length === 0) {
+        throw new Error("scenes.json is empty — start a fresh run instead.");
+      }
+      const health = analyzeScenePlan(savedScenes);
+      if (health.ok) {
+        scenes = savedScenes;
+        log(runId, "info", `Resume: reusing saved scene plan (${scenes.length} scenes)`, { stage: "scene_split" });
+      } else {
+        reuseSavedAssets = false;
+        if (mode === "hybrid" || mode === "stock") {
+          scenes = (await splitHybridScript(runId, script, mode === "stock" ? 0 : freshMinutes * 60, scenePrompt)).scenes;
+        } else {
+          const repaired = normalizeNarrationScenes(savedScenes);
+          const repairedHealth = analyzeScenePlan(repaired);
+          scenes = repairedHealth.ok ? repaired : await splitScript(runId, script, scenePrompt);
+        }
+        try {
+          fs.copyFileSync(scenesPath, path.join(runDir, `scenes.microchunks.${Date.now()}.json`));
+        } catch {}
+        fs.writeFileSync(scenesPath, JSON.stringify(scenes, null, 2), "utf-8");
+        archiveMediaForScenePlanChange(runDir);
+        log(
+          runId,
+          "warn",
+          `${health.issue} Rebuilt it into ${scenes.length} sentence-safe beats. Old media was archived so this resume cannot reuse broken scene files.`,
+          { stage: "scene_split", data: { before: health, after: analyzeScenePlan(scenes) } }
+        );
+      }
+    } else {
+      reuseSavedAssets = false;
+      scenes = mode === "hybrid" || mode === "stock"
+        ? (await splitHybridScript(runId, script, mode === "stock" ? 0 : freshMinutes * 60, scenePrompt)).scenes
+        : await splitScript(runId, script, scenePrompt);
+      checkCancelled(runId);
+      fs.writeFileSync(scenesPath, JSON.stringify(scenes, null, 2), "utf-8");
+    }
+    checkCancelled(runId);
+
+    // 2. Decide the fresh/stock cut-over by cumulative estimated narration.
+    const hasSourceMarkers = scenes.some((s) => s.source_kind === "fresh" || s.source_kind === "stock");
+    const freshCutoffSec = freshMinutes * 60;
+    let cum = 0;
+    let freshCount = hasSourceMarkers ? scenes.filter((s) => s.source_kind === "fresh").length : 0;
+    if (!hasSourceMarkers) {
+      for (const s of scenes) {
+        if (cum >= freshCutoffSec) break;
+        cum += Math.max(1, s.duration_hint_sec || 5);
+        freshCount++;
+      }
+    }
+    // If the whole script fits in the fresh window, there's no stock tail.
+    const stockCount = scenes.length - freshCount;
+    const splitSummary =
+      mode === "full"
+        ? `${scenes.length} scenes · all fresh AI clips`
+        : mode === "stock"
+          ? `${scenes.length} scenes · all stock B-roll`
+          : `${scenes.length} scenes · first ${freshCount} fresh (≈${freshMinutes} min), ${stockCount} from stock library`;
+    log(runId, "info", splitSummary, { stage: "pipeline" });
+
+    const freshScenes = scenes.filter((s) => s.index < freshCount);
+    const tailScenes = scenes.filter((s) => s.index >= freshCount);
+
+    // 3. Cache the stock library locally (only if we need a tail).
+    let pickStockPath: (() => string) | null = null;
+    if (stockCount > 0) {
+      const cached = await cacheStockLibrary(runId, stockFolder);
+      checkCancelled(runId);
+      if (cached.length === 0) {
+        throw new Error(`Stock library "${stockFolder}" produced no usable clips — add clips to Drive or lower HYBRID_FRESH_MINUTES.`);
+      }
+      const plan = createShuffledStockDeckPicker(cached, runId);
+      pickStockPath = plan.pick;
+      log(
+        runId,
+        "info",
+        `Stock deck shuffled: ${plan.deckSize ?? cached.length} clips · one full pass before repeats · seed ${runId.slice(0, 8)}`,
+        { stage: "reuse", data: { mode: plan.mode, deckSize: plan.deckSize, stockBeatCount: tailScenes.length } }
+      );
+    }
+
+    const { keyCount, imagePerKey, ttsPerKey, animPerKey, imageSlots, ttsSlots, animSlots, limitImage, limitTts, limitAnim } = await makeLimiters(runId);
+    log(
+      runId,
+      "info",
+      `${freshScenes.length} fresh synced scenes + continuous-voice tail over ${tailScenes.length} scenes. Keys: ${keyCount} · image=${imageSlots} (${imagePerKey}/key), TTS=${ttsSlots} (${ttsPerKey}/key), video=${animSlots} (${animPerKey}/key)`,
+      { stage: "pipeline" }
+    );
+    log(runId, "info", "Fresh opening starts voice and visuals together.", { stage: "pipeline" });
+
+    const tailPromise: Promise<{ path: string } | null> = (async () => {
+      if (tailScenes.length === 0 || !pickStockPath) return null;
+      checkCancelled(runId);
+      const tailPath = path.join(runDir, "tail.mp4");
+      const tailText = tailScenes.map((s) => s.text).join(" ");
+      const tailAudioPath = path.join(audioDir, "tail_voiceover.mp3");
+      const tailAudio = await limitTts(() => synthesizeContinuous(runId, tailText, tailAudioPath, ttsOpts));
+      checkCancelled(runId);
+      if (reuseSavedAssets && fileReady(tailPath)) {
+        const tailDuration = await probeDurationSafe(tailPath);
+        if (tailDuration >= Math.max(1, tailAudio.durationSec - 1)) {
+          log(runId, "info", "Tail segment already exists — reusing it", { stage: "assemble" });
+          return { path: tailPath };
+        }
+        log(runId, "warn", "Tail segment was incomplete — rebuilding from saved B-roll clips", { stage: "assemble" });
+      }
+      checkCancelled(runId);
+      return assembleTail(runId, tailAudio.filePath, pickStockPath, runDir);
+    })().catch((e) => {
+      if (e instanceof CancelledError) throw e;
+      const msg = e instanceof Error ? e.message : String(e);
+      log(runId, "error", `Tail failed: ${msg.slice(0, 600)}`, { stage: "pipeline" });
+      throw e;
+    });
+
+    // 4a. Fresh opening — per-scene voiceover + fresh AI clip, frame-synced.
+    const settledFresh = await Promise.all(
+      freshScenes.map(async (scene): Promise<SceneAVItem | null> => {
+        try {
+          checkCancelled(runId);
+          const audioPath = path.join(audioDir, `scene_${String(scene.index).padStart(3, "0")}.mp3`);
+          const vPath = videoPathFor(animDir, scene.index);
+          const audioPromise = reuseSavedAssets && fileReady(audioPath)
+            ? probeDurationSafe(audioPath).then((durationSec) => ({ filePath: audioPath, durationSec }))
+            : limitTts(() => synthesizeScene(runId, scene, audioDir, ttsOpts));
+          const videoPromise = reuseSavedAssets && generatedVideoReady(vPath)
+            ? Promise.resolve(vPath)
+            : generateSceneVideoFromImage(
+              runId,
+              scene,
+              imageDir,
+              animDir,
+              videoOpts,
+              { limitImage, limitAnim },
+              null
+            );
+          const [audio, v] = await Promise.all([audioPromise, videoPromise]);
+          if (!v) throw new Error(`Scene #${scene.index} produced no fresh clip`);
+          return { index: scene.index, videoPath: v, audioPath: audio.filePath, kind: "fresh" };
+        } catch (e) {
+          if (e instanceof CancelledError) throw e;
+          const msg = e instanceof Error ? e.message : String(e);
+          log(runId, "error", `Scene #${scene.index} failed: ${msg.slice(0, 600)}`, { stage: "pipeline" });
+          return null;
+        }
+      })
+    );
+    const freshItems = settledFresh.filter((x): x is SceneAVItem => x !== null);
+
+    // 4b. Tail — ONE continuous voiceover over selected stock clips (fade-to-black).
+    const tail = await tailPromise;
+
+    // Fail only if the fresh opening mostly failed (the tail is best-effort B-roll).
+    enforceFailureThreshold(runId, freshScenes.length, freshItems.length);
+    if (freshItems.length === 0 && !tail) throw new Error("No scenes succeeded");
+
+    // 5. Assemble: fresh per-scene (synced) + continuous tail.
+    checkCancelled(runId);
+    const { finalPath, totalSec, maxDriftSec } = await assembleHybrid(runId, freshItems, tail, runDir);
+    const items = freshItems;
+
+    // Persist a sync report so the UI can prove alignment.
+    try {
+      fs.writeFileSync(
+        path.join(runDir, "sync-report.json"),
+        JSON.stringify(
+          {
+            mode,
+            freshScenes: freshItems.length,
+            continuousTail: !!tail,
+            tailScenes: tail ? tailScenes.length : 0,
+            totalSec,
+            freshMaxDriftSec: maxDriftSec,
+          },
+          null,
+          2
+        ),
+        "utf-8"
+      );
+    } catch {}
+
+    log(
+      runId,
+      "success",
+      `Sync report: ${freshItems.length} fresh synced scenes${tail ? " + continuous tail" : ""} · ${(totalSec / 60).toFixed(1)} min · fresh max drift ${maxDriftSec.toFixed(3)}s`,
+      { stage: "assemble" }
+    );
+
+    // 6. Poster + Drive sync (best-effort) + mark done.
+    try {
+      await ensureVideoPoster(finalPath, path.join(runDir, "final-poster.jpg"));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      log(runId, "warn", `Poster preview failed (video is still usable): ${msg.slice(0, 160)}`, { stage: "assemble" });
+    }
+    try {
+      checkCancelled(runId);
+      const assets: AssembleInput[] = items
+        .filter((it) => it.kind === "fresh")
+        .map((it) => {
+          const scene = scenes.find((s) => s.index === it.index)!;
+          return {
+            scene,
+            imagePath: it.videoPath,
+            videoPath: it.videoPath,
+            audio: { filePath: it.audioPath, durationSec: 0 },
+          };
+        });
+      await syncRunToDrive(runId, assets, runDir, finalPath);
+      checkCancelled(runId);
+    } catch (e) {
+      if (e instanceof CancelledError) throw e;
+      const msg = e instanceof Error ? e.message : String(e);
+      log(runId, "warn", `Drive sync failed (local files preserved): ${msg}`, { stage: "gdrive" });
+    }
+
+    checkCancelled(runId);
+    updateRun.run("done", finalPath, runId);
+    const label = mode === "stock" ? "Stock Cut" : mode === "full" ? "Full Render" : "Hybrid";
+    log(runId, "success", `${label} pipeline complete`, { stage: "pipeline", data: { finalPath } });
   } catch (e) {
     handlePipelineError(runId, e);
   }

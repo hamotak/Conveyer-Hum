@@ -1,5 +1,6 @@
 import "./globals.css";
 import type { ReactNode } from "react";
+import Script from "next/script";
 import { Sidebar } from "./_sidebar";
 
 /*
@@ -23,9 +24,14 @@ const themeScript = `try{if(localStorage.getItem('theme')==='light'){document.do
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en">
-      <body>
-        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
+    // suppressHydrationWarning: the anti-FOUC themeScript below mutates <html>'s
+    // data-theme before React hydrates, and browser extensions commonly inject
+    // attributes on <html>/<body>. Both are expected and must not warn. This
+    // suppression is one level deep only (these elements' own attributes), so
+    // real mismatches inside the app still surface.
+    <html lang="en" suppressHydrationWarning>
+      <body suppressHydrationWarning>
+        <Script id="theme-bootstrap" strategy="beforeInteractive" dangerouslySetInnerHTML={{ __html: themeScript }} />
         <div className="app-shell">
           <Sidebar />
           <main className="app-main">

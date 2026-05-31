@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { ensureInit } from "@/lib/init";
 import { getSetting } from "@/lib/settings";
-import { getKeyCount } from "@/lib/services/labs69";
+import { discoverLabs69Runtime, getKeyCount } from "@/lib/services/labs69";
 import { videoModelLabel } from "@/lib/video-model";
 
 /**
@@ -14,10 +14,11 @@ import { videoModelLabel } from "@/lib/video-model";
  */
 export async function GET() {
   ensureInit();
-  const keyCount = getKeyCount();
-  const imageConcurrencyPerKey = Math.max(1, Number(getSetting("IMAGE_CONCURRENCY") || "5"));
+  const runtime = await discoverLabs69Runtime().catch(() => null);
+  const keyCount = runtime?.keyCount ?? getKeyCount();
+  const imageConcurrencyPerKey = Math.max(1, runtime?.imagePerKey ?? Number(getSetting("IMAGE_CONCURRENCY") || "5"));
   const ttsConcurrencyPerKey = Math.max(1, Number(getSetting("TTS_CONCURRENCY") || "3"));
-  const animConcurrencyPerKey = Math.max(1, Number(getSetting("ANIMATION_CONCURRENCY") || "3"));
+  const animConcurrencyPerKey = Math.max(1, runtime?.videoPerKey ?? Number(getSetting("ANIMATION_CONCURRENCY") || "3"));
   const assembleConcurrency = Math.max(1, Number(getSetting("ASSEMBLE_CONCURRENCY") || "4"));
   const xfadeChunks = Math.max(1, Number(getSetting("ASSEMBLE_XFADE_CHUNKS") || "4"));
   const animationProvider = (getSetting("ANIMATION_PROVIDER") || "off").toLowerCase();
@@ -25,6 +26,7 @@ export async function GET() {
 
   return NextResponse.json({
     keyCount,
+    capabilitySource: runtime?.source ?? "settings",
     perKey: {
       image: imageConcurrencyPerKey,
       tts: ttsConcurrencyPerKey,

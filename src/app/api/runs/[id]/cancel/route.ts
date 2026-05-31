@@ -16,15 +16,17 @@ export async function POST(_: Request, ctx: { params: Promise<{ id: string }> })
   const row = getRun.get(id) as { id: string; status: string } | undefined;
   if (!row) return NextResponse.json({ error: "run not found" }, { status: 404 });
 
-  if (row.status === "running" || row.status === "pending") {
+  const jobs = getActiveJobs(id);
+  if (row.status === "running" || row.status === "pending" || jobs.length > 0) {
     // Flag the run so the pipeline bails at its next checkpoint…
     markCancelled(id);
-    updateStatus.run("cancelled", id);
+    if (row.status === "running" || row.status === "pending") {
+      updateStatus.run("cancelled", id);
+    }
 
     // …and actively cancel the PAID 69labs jobs already in flight, so Stop
     // actually stops billing instead of letting TTS/video finish in the
     // background. Best-effort + parallel; failures are logged, never thrown.
-    const jobs = getActiveJobs(id);
     if (jobs.length > 0) {
       log(id, "warn", `Cancelling ${jobs.length} active 69labs job(s)…`, { stage: "pipeline" });
       await Promise.all(

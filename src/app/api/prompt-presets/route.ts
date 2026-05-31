@@ -22,6 +22,8 @@ export async function POST(req: Request) {
     voice_style?: number | null;
     voice_id?: string | null;
     voice_provider?: string | null;
+    stock_folder?: string | null;
+    hybrid_fresh_minutes?: number | null;
   };
   try {
     body = (await req.json()) as typeof body;
@@ -45,6 +47,8 @@ export async function POST(req: Request) {
       voice_style: body.voice_style,
       voice_id: body.voice_id,
       voice_provider: body.voice_provider,
+      stock_folder: body.stock_folder,
+      hybrid_fresh_minutes: body.hybrid_fresh_minutes,
     });
     return NextResponse.json({ ok: true, id });
   } catch (e) {

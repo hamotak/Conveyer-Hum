@@ -29,33 +29,39 @@ const iconProps = {
 
 const NAV: NavGroup[] = [
   {
-    header: "Modes",
+    header: null,
     items: [
       {
         href: "/",
-        label: "Video",
+        label: "Create",
         exact: true,
         icon: (
           <svg {...iconProps}>
-            <rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18" />
-            <path d="M7 2v20M17 2v20M2 12h20M2 7h5M2 17h5M17 17h5M17 7h5" />
+            <path d="m15.232 5.232 3.536 3.536M20.5 7.5 7.5 20.5l-4 1 1-4L17.5 4.5a1.414 1.414 0 0 1 3 3z" />
           </svg>
         ),
       },
       {
-        href: "/reassembly",
-        label: "Re-assembly",
+        href: "/clips",
+        label: "Clips",
         icon: (
           <svg {...iconProps}>
-            <path d="M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5" />
+            <rect x="2" y="3" width="20" height="14" rx="2" />
+            <path d="m10 8 5 3-5 3V8z" />
+            <path d="M2 21h20" />
           </svg>
         ),
       },
-    ],
-  },
-  {
-    header: "Work",
-    items: [
+      {
+        href: "/library",
+        label: "Saved Videos",
+        icon: (
+          <svg {...iconProps}>
+            <path d="M4 19.5V5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-1.5z" />
+            <path d="M8 7h6M8 11h7M8 15h5" />
+          </svg>
+        ),
+      },
       {
         href: "/runs",
         label: "Runs",
@@ -66,20 +72,10 @@ const NAV: NavGroup[] = [
           </svg>
         ),
       },
-      {
-        href: "/library",
-        label: "Library",
-        icon: (
-          <svg {...iconProps}>
-            <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
-            <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
-          </svg>
-        ),
-      },
     ],
   },
   {
-    header: "Setup",
+    header: null,
     items: [
       {
         href: "/prompts",
@@ -106,8 +102,8 @@ const NAV: NavGroup[] = [
 
 export function Sidebar() {
   const pathname = usePathname();
-  const [open, setOpen] = useState(false); // mobile drawer
   const [collapsed, setCollapsed] = useState(false); // desktop icons-only rail
+  const [drawerOpen, setDrawerOpen] = useState(false);
 
   // Restore the persisted desktop-collapsed preference after mount (server
   // renders expanded, so there's no hydration mismatch).
@@ -127,20 +123,40 @@ export function Sidebar() {
     });
   }
 
-  // Close the drawer on navigation.
   useEffect(() => {
-    setOpen(false);
-  }, [pathname]);
+    if (typeof window === "undefined") return;
+    const syncDrawer = () => {
+      setDrawerOpen(window.location.hash === "#app-sidebar");
+    };
+    syncDrawer();
+    window.addEventListener("hashchange", syncDrawer);
+    return () => window.removeEventListener("hashchange", syncDrawer);
+  }, []);
 
-  // ESC closes the drawer while it's open.
+  // Keep the hash-driven mobile drawer in sync with route changes.
   useEffect(() => {
-    if (!open) return;
+    if (!drawerOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key === "Escape") {
+        closeDrawer();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open]);
+  }, [drawerOpen]);
+
+  function openDrawer() {
+    if (typeof window !== "undefined") {
+      window.location.hash = "#app-sidebar";
+    }
+  }
+
+  function closeDrawer() {
+    if (typeof window !== "undefined") {
+      window.history.replaceState({}, "", window.location.pathname + window.location.search);
+    }
+    setDrawerOpen(false);
+  }
 
   return (
     <>
@@ -149,8 +165,9 @@ export function Sidebar() {
         <button
           aria-label="Open menu"
           className="btn-ghost btn-sm"
-          onClick={() => setOpen(true)}
+          role="button"
           style={{ display: "flex", alignItems: "center", padding: 8 }}
+          onClick={openDrawer}
         >
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
             <path d="M3 6h18M3 12h18M3 18h18" />
@@ -162,10 +179,10 @@ export function Sidebar() {
         </div>
       </div>
 
-      {/* Drawer backdrop (mobile, when open). */}
-      {open && <div className="app-backdrop" onClick={() => setOpen(false)} />}
-
-      <aside id="app-sidebar" className={`app-sidebar${open ? " open" : ""}${collapsed ? " collapsed" : ""}`}>
+      <aside
+        id="app-sidebar"
+        className={`app-sidebar${collapsed ? " collapsed" : ""}${drawerOpen ? " open" : ""}`}
+      >
         {/* Logo + collapse / close controls */}
         <div className="sidebar-head">
           <div className="sidebar-mark" style={{ width: 30, height: 30, fontSize: 15, boxShadow: "var(--shadow-sm)" }}>
@@ -194,8 +211,8 @@ export function Sidebar() {
           <button
             aria-label="Close menu"
             className="sidebar-close btn-ghost btn-sm"
-            onClick={() => setOpen(false)}
             style={{ marginLeft: "auto", padding: 6 }}
+            onClick={closeDrawer}
           >
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round">
               <path d="M18 6 6 18M6 6l12 12" />
@@ -230,7 +247,11 @@ export function Sidebar() {
                   <Link
                     key={item.href}
                     href={item.href}
-                    onClick={() => setOpen(false)}
+                    onClick={() => {
+                      if (drawerOpen) {
+                        closeDrawer();
+                      }
+                    }}
                     className={`sidebar-link${active ? " active" : ""}`}
                     title={item.label}
                     aria-label={item.label}
@@ -256,6 +277,12 @@ export function Sidebar() {
           </div>
         </div>
       </aside>
+
+      {/* Drawer backdrop (mobile, when open). */}
+      <a href="#" className="app-backdrop" aria-label="Close mobile menu" onClick={(event) => {
+        event.preventDefault();
+        closeDrawer();
+      }} />
     </>
   );
 }

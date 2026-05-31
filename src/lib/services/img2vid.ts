@@ -1,9 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { getSetting } from "../settings";
 import { log } from "../logger";
 import type { Scene } from "./scene-split";
 import { createVideoJob, pollJob, downloadJob, cancelJob, releaseJob } from "./labs69";
+import { pollTimeoutMs } from "./labs69-capacity";
 import { CancelledError, checkCancelled, isCancelled, registerJob, unregisterJob } from "../cancellation";
 
 /**
@@ -49,6 +51,9 @@ export async function animateScene(
       throw new Error(
         "69labs image-to-video needs a 69labs image keyframe. Set IMAGE_PROVIDER=69labs, or use a video provider that accepts local image files."
       );
+    }
+    if (imagePath && !options.providerJobId) {
+      throw new Error("69labs image-to-video needs the source image job id; refusing to fall back to prompt-only video.");
     }
     await labs69Img2Vid(
       runId,
@@ -121,7 +126,7 @@ async function labs69Img2Vid(
       const n = parseInt(String(durationSetting).replace(/[^0-9]/g, ""), 10);
       if (Number.isFinite(n) && n > 0) duration = `${n}s`;
     } else {
-      const sceneDur = Math.max(4, Math.min(10, Math.ceil(scene.duration_hint_sec || 5)));
+      const sceneDur = Math.max(4, Math.min(8, Math.ceil(scene.duration_hint_sec || 5)));
       duration = `${sceneDur}s`;
     }
   }
@@ -148,13 +153,24 @@ async function labs69Img2Vid(
       log(
         runId,
         "debug",
-        `69labs video job ${jobId.slice(0, 8)}… (${usableJobId ? "image-to-video keyframe" : "text-only"}, attempt=${attempt})`,
+        `69labs video job ${jobId.slice(0, 8)}… (${usableJobId ? "image-to-video keyframe" : "text-only"}, model=${model ?? "default"}, timeout=${Math.round(pollTimeoutMs("videos", model) / 60_000)}m, attempt=${attempt})`,
         { stage: "animate" }
       );
       checkCancelled(runId); // before polling
-      await pollJob("videos", jobId, runId, "animate");
+      await pollJob("videos", jobId, runId, "animate", "debug", { model });
       checkCancelled(runId); // after polling, before download
       await downloadJob("videos", jobId, outPath);
+      const cleanup = await cleanProviderCornerMark(runId, outPath, model);
+      writeSceneVideoManifest(outPath, {
+        sourceMode: usableJobId ? "image-to-video" : "text-to-video",
+        provider: "69labs",
+        imageProvider,
+        imageJobId: usableJobId ?? null,
+        videoJobId: jobId,
+        model: model ?? null,
+        aspectRatio: aspectRatio ?? null,
+        cleanup,
+      });
       unregisterJob(runId, jobId);
       return;
     } catch (e) {
@@ -194,6 +210,103 @@ async function labs69Img2Vid(
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
+type CornerCleanupStatus =
+  | { status: "cleaned"; method: string; cropPercent: number }
+  | { status: "disabled"; message: string }
+  | { status: "not_applicable"; message: string }
+  | { status: "missing"; message: string }
+  | { status: "failed"; message: string };
+
+async function cleanProviderCornerMark(runId: string, filePath: string, model?: string | null): Promise<CornerCleanupStatus> {
+  if (getSetting("CLEAN_PROVIDER_WATERMARK") === "0") {
+    return { status: "disabled", message: "CLEAN_PROVIDER_WATERMARK=0" };
+  }
+  if (!/^veo/i.test(model ?? "")) {
+    return { status: "not_applicable", message: "Current video model does not use the provider corner mark cleanup." };
+  }
+  if (!fs.existsSync(filePath)) return { status: "missing", message: "Downloaded video file was not found." };
+
+  const tmp = filePath.replace(/\.mp4$/i, ".cleaned.mp4");
+  try {
+    await runFfmpeg([
+      "-y",
+      "-i",
+      filePath,
+      "-vf",
+      "crop=trunc(iw*0.90/2)*2:trunc(ih*0.90/2)*2:0:0",
+      "-map",
+      "0:v:0",
+      "-map",
+      "0:a?",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-crf",
+      "20",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "copy",
+      "-movflags",
+      "+faststart",
+      tmp,
+    ]);
+    fs.renameSync(tmp, filePath);
+    log(runId, "debug", `Cleaned provider corner mark: ${path.basename(filePath)}`, { stage: "animate" });
+    return { status: "cleaned", method: "crop-top-left-90-percent", cropPercent: 90 };
+  } catch (e) {
+    try {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    } catch {}
+    const msg = e instanceof Error ? e.message : String(e);
+    log(runId, "warn", `Corner-mark cleanup skipped for ${path.basename(filePath)}: ${msg.slice(0, 220)}`, {
+      stage: "animate",
+    });
+    return { status: "failed", message: msg.slice(0, 500) };
+  }
+}
+
+function writeSceneVideoManifest(outPath: string, manifest: Record<string, unknown>): void {
+  try {
+    const stat = fs.statSync(outPath);
+    fs.writeFileSync(
+      outPath.replace(/\.mp4$/i, ".manifest.json"),
+      JSON.stringify(
+        {
+          createdAt: new Date().toISOString(),
+          target: path.basename(outPath),
+          fileSize: stat.size,
+          fileMtimeMs: stat.mtimeMs,
+          ...manifest,
+        },
+        null,
+        2
+      ),
+      "utf-8"
+    );
+  } catch {
+    /* best-effort generation evidence */
+  }
+}
+
+function runFfmpeg(args: string[]): Promise<void> {
+  const cmd = getSetting("FFMPEG_PATH").trim() || "ffmpeg";
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (d) => {
+      stderr += String(d);
+      if (stderr.length > 3000) stderr = stderr.slice(-3000);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-800)}`));
+    });
+  });
 }
 
 async function replicateImg2Vid(scene: Scene, imagePath: string, outPath: string) {

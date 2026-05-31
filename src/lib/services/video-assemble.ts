@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import ffmpeg from "fluent-ffmpeg";
 import { getSetting } from "../settings";
 import { log } from "../logger";
@@ -102,6 +103,7 @@ export async function assembleVideo(
     await concatSimple(clipInfos.map((c) => c.path), clipsDir, finalPath);
   }
 
+  await cleanFinalCornerMark(runId, finalPath, w, h, scenes.map((s) => s.videoPath).filter(Boolean) as string[]);
   log(runId, "success", `Final video: ${finalPath}`, { stage: "assemble" });
   return finalPath;
 }
@@ -317,9 +319,23 @@ async function renderAnimatedClip(
 }
 
 /** Simple stream-copy concat (no transitions). */
+function ffconcatLine(filePath: string): string {
+  // FFmpeg concat files use single-quoted paths. Escape apostrophes so folders
+  // like "Queen Anne's Revenge" do not break recovery assembly.
+  return `file '${filePath.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`;
+}
+
+function fileReady(filePath: string): boolean {
+  try {
+    return fs.statSync(filePath).size > 0;
+  } catch {
+    return false;
+  }
+}
+
 function concatSimple(clipPaths: string[], clipsDir: string, finalPath: string): Promise<void> {
-  const listFile = path.join(clipsDir, "concat.txt");
-  fs.writeFileSync(listFile, clipPaths.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n"), "utf-8");
+  const listFile = path.join(clipsDir, `concat_${randomUUID().slice(0, 8)}.txt`);
+  fs.writeFileSync(listFile, clipPaths.map(ffconcatLine).join("\n"), "utf-8");
   return new Promise((resolve, reject) => {
     ffmpeg()
       .input(listFile)
@@ -524,6 +540,7 @@ export async function assembleContinuous(
   // 3. Lay the continuous audio over it, trim to the audio length, add edge fades.
   const finalPath = path.join(outDir, "final.mp4");
   await muxAudioWithFades(silentPath, audioPath, finalPath, audioDur, fps);
+  await cleanFinalCornerMark(runId, finalPath, w, h, clips.map((clip) => clip.path));
   try {
     fs.unlinkSync(silentPath);
   } catch {}
@@ -624,6 +641,497 @@ export async function kenBurnsBufferFromClip(
     fs.unlinkSync(framePath);
   } catch {}
   return outPath;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Per-scene hybrid assembly (Mission 1 + 3)
+//
+// Each scene has its OWN narration mp3. Each scene's video clip is rendered to
+// EXACTLY that scene's audio length (padded with a held final frame if needed,
+// trimmed if longer) with the narration muxed in. Then all per-scene clips are
+// concatenated. Because every clip == its scene's audio, the picture can NEVER
+// drift from the voice — final duration == sum of scene-audio durations.
+//
+// This is the sync-correct path: no word-count guessing, no continuous-audio
+// re-allocation. Fresh AI clips and stock B-roll clips are treated identically.
+// ───────────────────────────────────────────────────────────────────────────
+
+export interface SceneAVItem {
+  /** Ordered scene index (for clip filenames + logs). */
+  index: number;
+  /** The video clip (fresh AI or stock B-roll). */
+  videoPath: string;
+  /** This scene's narration mp3. */
+  audioPath: string;
+  /** Label for logs: "fresh" | "stock". */
+  kind?: string;
+}
+
+/**
+ * Render one scene clip to its narration length and mux the narration in.
+ * Fresh AI scenes should already be split to fit the provider clip length.
+ * If an older scene is still slightly longer, hold the final frame instead of
+ * visibly looping the same generated motion.
+ */
+async function renderSceneAV(
+  runId: string,
+  item: SceneAVItem,
+  outPath: string,
+  w: number,
+  h: number,
+  fps: number
+): Promise<number> {
+  const audioDur = await probeDuration(item.audioPath);
+  const videoDur = await probeDuration(item.videoPath).catch(() => 0);
+  const padSec = videoDur > 0 && audioDur > videoDur + 0.05 ? audioDur - videoDur + 0.1 : 0;
+  const fadeSec = item.kind === "fresh" ? Math.min(0.75, Math.max(0.25, audioDur * 0.18)) : 0;
+  const freshUsableVideoEnd =
+    item.kind === "fresh" && videoDur > 1.25
+      ? Math.max(0.5, videoDur - Math.min(0.35, videoDur * 0.12))
+      : videoDur;
+  const visualEndSec = item.kind === "fresh" ? Math.max(0.5, Math.min(audioDur, freshUsableVideoEnd)) : audioDur;
+  const blackHoldSec = item.kind === "fresh" ? Math.max(0, audioDur - visualEndSec) : 0;
+  if (item.kind === "fresh" && blackHoldSec > 0.75) {
+    log(runId, "warn", `Fresh clip #${item.index + 1} is ${blackHoldSec.toFixed(1)}s shorter than narration; fading to black instead of freezing the final frame.`, {
+      stage: "assemble",
+    });
+  }
+  const filters = [
+    `scale=${w}:${h}:force_original_aspect_ratio=increase`,
+    `crop=${w}:${h}`,
+    padSec > 0 ? `tpad=stop_mode=clone:stop_duration=${padSec.toFixed(3)}` : null,
+    fadeSec > 0 ? `fade=t=in:st=0:d=${fadeSec.toFixed(3)}` : null,
+    fadeSec > 0 ? `fade=t=out:st=${Math.max(0, visualEndSec - fadeSec).toFixed(3)}:d=${fadeSec.toFixed(3)}` : null,
+    blackHoldSec > 0.05 ? `tpad=stop_mode=add:stop_duration=${blackHoldSec.toFixed(3)}:color=black` : null,
+  ].filter(Boolean).join(",");
+
+  await new Promise<void>((resolve, reject) => {
+    const cmd = ffmpeg();
+    cmd.input(item.videoPath);
+    cmd.input(item.audioPath);
+    cmd
+      .videoFilters(filters)
+      .outputOptions([
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        `-t ${audioDur.toFixed(3)}`,
+        `-r ${fps}`,
+        "-c:v libx264",
+        "-preset veryfast",
+        "-crf 23",
+        "-pix_fmt yuv420p",
+        "-c:a aac",
+        "-b:a 192k",
+        "-movflags +faststart",
+        "-shortest",
+      ])
+      .on("error", reject)
+      .on("end", () => resolve())
+      .save(outPath);
+  });
+  return audioDur;
+}
+
+export interface PerSceneAssemblyResult {
+  finalPath: string;
+  totalSec: number;
+  /** Max |clipSec - audioSec| across scenes — should be ~0 (proof of sync). */
+  maxDriftSec: number;
+}
+
+/**
+ * Assemble the final video from per-scene (video + narration) pairs.
+ * Returns the final path plus a sync report (max drift, total duration).
+ */
+export async function assemblePerScene(
+  runId: string,
+  items: SceneAVItem[],
+  outDir: string
+): Promise<PerSceneAssemblyResult> {
+  ensureFfmpegPaths();
+  const resolution = getSetting("VIDEO_RESOLUTION") || "1920x1080";
+  const fps = Number(getSetting("VIDEO_FPS") || "30");
+  const concurrency = Math.max(1, Number(getSetting("ASSEMBLE_CONCURRENCY") || "4"));
+  const [w, h] = resolution.split("x").map(Number);
+
+  const clipsDir = path.join(outDir, "clips");
+  if (!fs.existsSync(clipsDir)) fs.mkdirSync(clipsDir, { recursive: true });
+
+  const ordered = [...items].sort((a, b) => a.index - b.index);
+  log(runId, "info", `Per-scene assembly: ${ordered.length} scenes (each clip fit to its own narration)`, {
+    stage: "assemble",
+  });
+
+  const limit = pLimit(concurrency);
+  let maxDrift = 0;
+  const rendered = await Promise.all(
+    ordered.map((item) =>
+      limit(async () => {
+        const clipPath = path.join(clipsDir, `clip_${String(item.index).padStart(3, "0")}.mp4`);
+        const audioDur = await renderSceneAV(runId, item, clipPath, w, h, fps);
+        const clipDur = await probeDuration(clipPath).catch(() => audioDur);
+        const drift = Math.abs(clipDur - audioDur);
+        if (drift > maxDrift) maxDrift = drift;
+        return { path: clipPath, index: item.index, dur: clipDur };
+      })
+    )
+  );
+  rendered.sort((a, b) => a.index - b.index);
+
+  const finalPath = path.join(outDir, "final.mp4");
+  await concatSimple(rendered.map((r) => r.path), clipsDir, finalPath);
+  await cleanFinalCornerMark(runId, finalPath, w, h, items.map((item) => item.videoPath));
+
+  const totalSec = await probeDuration(finalPath).catch(() => rendered.reduce((s, r) => s + r.dur, 0));
+  log(
+    runId,
+    "success",
+    `Final video: ${finalPath} · ${(totalSec / 60).toFixed(1)} min · sync drift ≤ ${maxDrift.toFixed(3)}s`,
+    { stage: "assemble" }
+  );
+  return { finalPath, totalSec, maxDriftSec: maxDrift };
+}
+
+/** Concatenate multiple audio files into one mp3 (re-encode for clean joins). */
+export async function concatAudioFiles(inputs: string[], outPath: string): Promise<void> {
+  ensureFfmpegPaths();
+  if (inputs.length === 1) {
+    fs.copyFileSync(inputs[0], outPath);
+    return;
+  }
+  const listFile = outPath.replace(/\.mp3$/i, `_alist_${randomUUID().slice(0, 8)}.txt`);
+  fs.writeFileSync(listFile, inputs.map(ffconcatLine).join("\n"), "utf-8");
+  await new Promise<void>((resolve, reject) => {
+    ffmpeg()
+      .input(listFile)
+      .inputOptions(["-f concat", "-safe 0"])
+      .outputOptions(["-c:a libmp3lame", "-b:a 192k"])
+      .on("error", reject)
+      .on("end", () => resolve())
+      .save(outPath);
+  });
+  try { fs.unlinkSync(listFile); } catch {}
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Continuous-tail assembly (Mission 3, refined)
+//
+// The hybrid run's TAIL (everything after the fresh opening) is built here:
+//   - ONE continuous voiceover (no per-scene editing) is laid over
+//   - selected stock clips at their full native length, each fading through
+//     black at the seams, looped until the narration ends, then trimmed to the
+//     exact audio length.
+// Returns a single tail.mp4 (video + audio) the caller concatenates after the
+// fresh per-scene section.
+// ───────────────────────────────────────────────────────────────────────────
+
+const TAIL_BLACK_FADE = 0.75; // seconds of fade-in/out to black per clip seam
+const TAIL_END_TRIM = 0.35; // avoid provider/library clips' static final frames
+
+/** Render one stock clip to WxH, silent, with a short fade-in/out through black. */
+async function renderTailClip(
+  src: string,
+  outPath: string,
+  w: number,
+  h: number,
+  fps: number,
+  maxDurationSec?: number
+): Promise<number> {
+  try {
+    if (fs.statSync(outPath).size > 0) {
+      return probeDuration(outPath).catch(() => maxDurationSec ?? 8);
+    }
+  } catch {
+    /* render below */
+  }
+  const srcDur = await probeDuration(src).catch(() => 8);
+  const usableSrcDur = srcDur > 1.25 ? Math.max(0.5, srcDur - Math.min(TAIL_END_TRIM, srcDur * 0.12)) : srcDur;
+  const dur = Math.max(0.5, Math.min(usableSrcDur, maxDurationSec ?? usableSrcDur));
+  const fade = Math.min(TAIL_BLACK_FADE, dur / 3);
+  const outStart = Math.max(0, dur - fade);
+  const vf = `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},fade=t=in:st=0:d=${fade.toFixed(
+    3
+  )},fade=t=out:st=${outStart.toFixed(3)}:d=${fade.toFixed(3)}`;
+  await new Promise<void>((resolve, reject) => {
+    ffmpeg()
+      .input(src)
+      .videoFilters(vf)
+      .outputOptions([
+        "-an",
+        `-r ${fps}`,
+        `-t ${dur.toFixed(3)}`,
+        "-c:v libx264",
+        "-preset veryfast",
+        "-crf 23",
+        "-pix_fmt yuv420p",
+        "-movflags +faststart",
+      ])
+      .on("error", reject)
+      .on("end", () => resolve())
+      .save(outPath);
+  });
+  return dur;
+}
+
+/**
+ * Build the tail segment: selected stock clips (fade-through-black) under a
+ * continuous voiceover, trimmed to the audio length. `pickClip` yields local
+ * clip paths in the caller's chosen order; Hybrid uses narration-matched stock.
+ */
+export async function assembleTail(
+  runId: string,
+  audioPath: string,
+  pickClip: () => string,
+  outDir: string,
+  outName = "tail.mp4"
+): Promise<{ path: string; durationSec: number }> {
+  ensureFfmpegPaths();
+  const resolution = getSetting("VIDEO_RESOLUTION") || "1920x1080";
+  const fps = Number(getSetting("VIDEO_FPS") || "30");
+  const concurrency = Math.max(1, Number(getSetting("ASSEMBLE_CONCURRENCY") || "4"));
+  const [w, h] = resolution.split("x").map(Number);
+
+  const tailDir = path.join(outDir, "tail-clips");
+  if (!fs.existsSync(tailDir)) fs.mkdirSync(tailDir, { recursive: true });
+
+  const audioDur = await probeDuration(audioPath);
+  log(runId, "info", `Tail: continuous voice ${(audioDur / 60).toFixed(1)} min over selected stock clips`, {
+    stage: "assemble",
+  });
+
+  // Pick enough selected clips to cover the audio using real clip durations.
+  // This matters for 1-2 hour videos: an 8-second guess can render hundreds of
+  // unnecessary clips when the stock library contains longer B-roll.
+  const picks: { src: string; sourceDurationSec: number; renderDurationSec: number }[] = [];
+  let covered = 0;
+  const targetCoverage = audioDur + 1;
+  while (covered < targetCoverage) {
+    const src = pickClip();
+    const sourceDurationSec = Math.max(0.5, await probeDuration(src).catch(() => 8));
+    const renderDurationSec = Math.min(sourceDurationSec, Math.max(0.5, targetCoverage - covered));
+    picks.push({ src, sourceDurationSec, renderDurationSec });
+    covered += renderDurationSec;
+    if (picks.length > 10000) {
+      throw new Error("Tail assembly picked too many stock clips — check the source clip durations.");
+    }
+  }
+  log(runId, "info", `Tail render plan: ${picks.length} stock clips cover ${(covered / 60).toFixed(1)} min`, {
+    stage: "assemble",
+  });
+
+  // Render the picked clips (faded) in parallel, preserving order.
+  const limit = pLimit(concurrency);
+  const rendered: { path: string; index: number; dur: number }[] = await Promise.all(
+    picks.map((pick, i) =>
+      limit(async () => {
+        const out = path.join(tailDir, `t_${String(i).padStart(4, "0")}.mp4`);
+        const dur = await renderTailClip(pick.src, out, w, h, fps, pick.renderDurationSec);
+        return { path: out, index: i, dur };
+      })
+    )
+  );
+  rendered.sort((a, b) => a.index - b.index);
+
+  // Concat the silent faded clips, then mux the continuous audio + trim to audio.
+  const silentPath = path.join(outDir, "tail-silent.mp4");
+  if (fileReady(silentPath)) {
+    log(runId, "info", "Tail silent video already exists — reusing it", { stage: "assemble" });
+  } else {
+    await concatSimple(rendered.map((r) => r.path), tailDir, silentPath);
+  }
+
+  const outPath = path.join(outDir, outName);
+  try {
+    fs.rmSync(outPath, { force: true });
+  } catch {
+    /* remove partial output from interrupted mux */
+  }
+  await new Promise<void>((resolve, reject) => {
+    ffmpeg()
+      .input(silentPath)
+      .input(audioPath)
+      .outputOptions([
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        `-t ${audioDur.toFixed(3)}`,
+        "-c:v copy",
+        "-c:a aac",
+        "-b:a 192k",
+        "-movflags +faststart",
+        "-shortest",
+      ])
+      .on("error", reject)
+      .on("end", () => resolve())
+      .save(outPath);
+  });
+  try { fs.unlinkSync(silentPath); } catch {}
+  try { fs.rmSync(tailDir, { recursive: true, force: true }); } catch {}
+
+  const durationSec = await probeDuration(outPath).catch(() => audioDur);
+  log(runId, "success", `Tail segment: ${(durationSec / 60).toFixed(1)} min (${rendered.length} stock clips)`, {
+    stage: "assemble",
+  });
+  return { path: outPath, durationSec };
+}
+
+/**
+ * Render the fresh per-scene clips AND (optionally) append a continuous tail
+ * segment, concatenating everything into the final video. Fresh scenes stay
+ * frame-synced (clip == its narration); the tail is one continuous-voice block.
+ */
+export async function assembleHybrid(
+  runId: string,
+  freshItems: SceneAVItem[],
+  tail: { path: string } | null,
+  outDir: string
+): Promise<PerSceneAssemblyResult> {
+  ensureFfmpegPaths();
+  const resolution = getSetting("VIDEO_RESOLUTION") || "1920x1080";
+  const fps = Number(getSetting("VIDEO_FPS") || "30");
+  const concurrency = Math.max(1, Number(getSetting("ASSEMBLE_CONCURRENCY") || "4"));
+  const [w, h] = resolution.split("x").map(Number);
+
+  const clipsDir = path.join(outDir, "clips");
+  if (!fs.existsSync(clipsDir)) fs.mkdirSync(clipsDir, { recursive: true });
+
+  const ordered = [...freshItems].sort((a, b) => a.index - b.index);
+  const limit = pLimit(concurrency);
+  let maxDrift = 0;
+  const rendered = await Promise.all(
+    ordered.map((item) =>
+      limit(async () => {
+        const clipPath = path.join(clipsDir, `clip_${String(item.index).padStart(3, "0")}.mp4`);
+        const audioDur = await renderSceneAV(runId, item, clipPath, w, h, fps);
+        const clipDur = await probeDuration(clipPath).catch(() => audioDur);
+        const drift = Math.abs(clipDur - audioDur);
+        if (drift > maxDrift) maxDrift = drift;
+        return { path: clipPath, index: item.index };
+      })
+    )
+  );
+  rendered.sort((a, b) => a.index - b.index);
+
+  const parts = rendered.map((r) => r.path);
+  if (tail) parts.push(tail.path);
+
+  const finalPath = path.join(outDir, "final.mp4");
+  await concatSimple(parts, clipsDir, finalPath);
+  await cleanFinalCornerMark(runId, finalPath, w, h, freshItems.map((item) => item.videoPath));
+  const totalSec = await probeDuration(finalPath).catch(() => 0);
+  log(
+    runId,
+    "success",
+    `Final video: ${(totalSec / 60).toFixed(1)} min · fresh sync drift ≤ ${maxDrift.toFixed(3)}s${tail ? " · + continuous tail" : ""}`,
+    { stage: "assemble" }
+  );
+  return { finalPath, totalSec, maxDriftSec: maxDrift };
+}
+
+async function cleanFinalCornerMark(
+  runId: string,
+  finalPath: string,
+  w: number,
+  h: number,
+  sourceVideoPaths: string[] = []
+): Promise<void> {
+  if (!fs.existsSync(finalPath)) return;
+
+  if (getSetting("CLEAN_PROVIDER_WATERMARK") === "0") {
+    writeWatermarkCleanupReport(finalPath, { status: "disabled", message: "CLEAN_PROVIDER_WATERMARK=0" });
+    return;
+  }
+
+  if (!shouldCleanFinalCornerMark(sourceVideoPaths)) {
+    writeWatermarkCleanupReport(finalPath, {
+      status: "not_applicable",
+      message: "No uncleaned generated provider clips were detected in this final.",
+    });
+    return;
+  }
+
+  const tmp = finalPath.replace(/\.mp4$/i, ".corner-cleaned.mp4");
+  try {
+    await new Promise<void>((resolve, reject) => {
+      ffmpeg(finalPath)
+        .videoFilters(`crop=trunc(iw*0.90/2)*2:trunc(ih*0.90/2)*2:0:0,scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h}`)
+        .outputOptions([
+          "-map 0:v:0",
+          "-map 0:a?",
+          "-c:v libx264",
+          "-preset veryfast",
+          "-crf 20",
+          "-pix_fmt yuv420p",
+          "-c:a copy",
+          "-movflags +faststart",
+        ])
+        .on("error", reject)
+        .on("end", () => resolve())
+        .save(tmp);
+    });
+    fs.renameSync(tmp, finalPath);
+    try {
+      fs.rmSync(path.join(path.dirname(finalPath), "final-poster.jpg"), { force: true });
+    } catch {}
+    writeWatermarkCleanupReport(finalPath, {
+      status: "cleaned",
+      method: "crop-top-left-90-percent-then-rescale",
+      cropPercent: 90,
+      outputWidth: w,
+      outputHeight: h,
+    });
+    log(runId, "debug", "Cleaned final video corner mark", { stage: "assemble" });
+  } catch (e) {
+    try {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    } catch {}
+    const msg = e instanceof Error ? e.message : String(e);
+    writeWatermarkCleanupReport(finalPath, { status: "failed", message: msg.slice(0, 500) });
+    log(runId, "warn", `Final corner-mark cleanup skipped: ${msg.slice(0, 240)}`, { stage: "assemble" });
+  }
+}
+
+function shouldCleanFinalCornerMark(sourceVideoPaths: string[]): boolean {
+  for (const videoPath of sourceVideoPaths) {
+    const manifestPath = videoPath.replace(/\.mp4$/i, ".manifest.json");
+    if (!fs.existsSync(manifestPath)) continue;
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8")) as {
+        sourceMode?: string;
+        provider?: string;
+        cleanup?: { status?: string };
+      };
+      if (manifest.provider !== "69labs" || manifest.sourceMode !== "image-to-video") continue;
+      const cleanupStatus = manifest.cleanup?.status;
+      if (cleanupStatus === "failed" || cleanupStatus === "missing") return true;
+    } catch {
+      continue;
+    }
+  }
+  return false;
+}
+
+function writeWatermarkCleanupReport(finalPath: string, report: Record<string, unknown>): void {
+  try {
+    const stat = fs.existsSync(finalPath) ? fs.statSync(finalPath) : null;
+    fs.writeFileSync(
+      path.join(path.dirname(finalPath), "watermark-cleanup-report.json"),
+      JSON.stringify(
+        {
+          enabled: getSetting("CLEAN_PROVIDER_WATERMARK") !== "0",
+          createdAt: new Date().toISOString(),
+          target: path.basename(finalPath),
+          fileSize: stat?.size ?? null,
+          fileMtimeMs: stat?.mtimeMs ?? null,
+          ...report,
+        },
+        null,
+        2
+      ),
+      "utf-8"
+    );
+  } catch {
+    /* best-effort quality evidence */
+  }
 }
 
 /** Video-only crossfade chain (silent clips). */

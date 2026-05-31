@@ -299,6 +299,74 @@ export async function getFileWebLink(fileId: string): Promise<string | null> {
   }
 }
 
+/** Move a Drive file to trash (recoverable ~30 days). Returns true on success. */
+export async function trashFile(fileId: string): Promise<boolean> {
+  const drive = getDriveClient();
+  if (!drive) throw new Error("Drive not connected");
+  await drive.files.update({ fileId, requestBody: { trashed: true } });
+  return true;
+}
+
+export async function listFoldersByName(name: string, parentId: string): Promise<Array<{ id: string; name: string }>> {
+  const drive = getDriveClient();
+  if (!drive) throw new Error("Drive not connected");
+  const escapedName = name.replace(/'/g, "\\'");
+  const out: Array<{ id: string; name: string }> = [];
+  let pageToken: string | undefined;
+  do {
+    const res = await drive.files.list({
+      q: `'${parentId}' in parents and name='${escapedName}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+      fields: "nextPageToken, files(id, name)",
+      pageSize: 100,
+      pageToken,
+    });
+    for (const f of res.data.files ?? []) {
+      if (f.id && f.name) out.push({ id: f.id, name: f.name });
+    }
+    pageToken = res.data.nextPageToken ?? undefined;
+  } while (pageToken);
+  return out;
+}
+
+export async function listFolderChildren(folderId: string): Promise<Array<{ id: string; name: string; mimeType?: string | null }>> {
+  const drive = getDriveClient();
+  if (!drive) throw new Error("Drive not connected");
+  const out: Array<{ id: string; name: string; mimeType?: string | null }> = [];
+  let pageToken: string | undefined;
+  do {
+    const res = await drive.files.list({
+      q: `'${folderId}' in parents and trashed=false`,
+      fields: "nextPageToken, files(id, name, mimeType)",
+      pageSize: 1000,
+      pageToken,
+    });
+    for (const f of res.data.files ?? []) {
+      if (f.id && f.name) out.push({ id: f.id, name: f.name, mimeType: f.mimeType });
+    }
+    pageToken = res.data.nextPageToken ?? undefined;
+  } while (pageToken);
+  return out;
+}
+
+export async function moveFileBetweenFolders(fileId: string, fromFolderId: string, toFolderId: string): Promise<void> {
+  const drive = getDriveClient();
+  if (!drive) throw new Error("Drive not connected");
+  await drive.files.update({
+    fileId,
+    addParents: toFolderId,
+    removeParents: fromFolderId,
+    fields: "id, parents",
+  });
+}
+
+/** Stream a Drive file's bytes (for in-app previews). Caller pipes to a response. */
+export async function getFileStream(fileId: string): Promise<NodeJS.ReadableStream> {
+  const drive = getDriveClient();
+  if (!drive) throw new Error("Drive not connected");
+  const res = await drive.files.get({ fileId, alt: "media" }, { responseType: "stream" });
+  return res.data as NodeJS.ReadableStream;
+}
+
 /** Download a file from Drive to a local path. */
 export async function downloadFile(fileId: string, destPath: string): Promise<void> {
   const drive = getDriveClient();

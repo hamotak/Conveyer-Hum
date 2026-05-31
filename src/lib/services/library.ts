@@ -76,7 +76,8 @@ async function readRunFolder(
   try {
     const found = await drive.files.list({
       q: `'${folder.id}' in parents and name='clips.json' and trashed=false`,
-      fields: "files(id)",
+      fields: "files(id, modifiedTime)",
+      orderBy: "modifiedTime desc",
       pageSize: 1,
     });
     const clipsJsonId = found.data.files?.[0]?.id;

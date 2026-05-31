@@ -1,6 +1,7 @@
 "use client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { voiceUid, selectedVoiceUid } from "@/lib/voice-key";
+import { ConfirmDialog, type ConfirmRequest } from "./_confirm-dialog";
 
 export interface VoiceOption {
   voiceId: string;
@@ -40,8 +41,7 @@ export function VoiceLibraryModal({ open, onClose, onSelect, selectedVoiceId }: 
   const [loading, setLoading] = useState(false);
   const [query, setQuery] = useState("");
   const [gender, setGender] = useState<GenderFilter>("all");
-  // Default to the user's saved voices; the celebrity/library catalog is one tab away.
-  const [source, setSource] = useState<SourceFilter>("saved");
+  const [source, setSource] = useState<SourceFilter>("all");
   const [sortAZ, setSortAZ] = useState(false);
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [showAdd, setShowAdd] = useState(false);
@@ -49,6 +49,7 @@ export function VoiceLibraryModal({ open, onClose, onSelect, selectedVoiceId }: 
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<string, { ok: boolean; msg: string }>>({});
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState<ConfirmRequest | null>(null);
 
   // Add-voice form
   const [aName, setAName] = useState("");
@@ -75,6 +76,12 @@ export function VoiceLibraryModal({ open, onClose, onSelect, selectedVoiceId }: 
   useEffect(() => {
     if (open) load();
   }, [open, load]);
+
+  useEffect(() => {
+    if (!open || loading) return;
+    if (voices.some((v) => v.source === "saved")) return;
+    if (voices.some((v) => v.source === "library")) setSource("library");
+  }, [loading, open, voices]);
 
   // Scroll lock + ESC to close while open.
   useEffect(() => {
@@ -171,16 +178,26 @@ export function VoiceLibraryModal({ open, onClose, onSelect, selectedVoiceId }: 
   /** Remove a saved voice (saved voices only). Never touches library/clone voices. */
   async function deleteVoice(v: VoiceOption) {
     if (v.source !== "saved" || !v.savedId) return;
-    if (!window.confirm(`Delete saved voice "${v.name}"? This only removes it from your list.`)) return;
-    setDeletingId(v.savedId);
-    try {
-      await fetch(`/api/voices/saved?id=${encodeURIComponent(v.savedId)}`, { method: "DELETE" });
-      await load();
-    } catch {
-      /* keep the modal open; a reload will re-sync state */
-    } finally {
-      setDeletingId(null);
-    }
+    const savedId = v.savedId;
+    setConfirming({
+      title: "Delete saved voice?",
+      body: `"${v.name}" will only be removed from your saved list. Provider/library voices are not deleted.`,
+      confirmLabel: "Delete voice",
+      danger: true,
+      onConfirm: async () => {
+        setDeletingId(savedId);
+        try {
+          const r = await fetch(`/api/voices/saved?id=${encodeURIComponent(savedId)}`, { method: "DELETE" });
+          if (!r.ok) {
+            const j = (await r.json().catch(() => ({}))) as { error?: string };
+            throw new Error(j.error ?? `Could not delete voice (HTTP ${r.status}).`);
+          }
+          await load();
+        } finally {
+          setDeletingId(null);
+        }
+      },
+    });
   }
 
   async function addVoice() {
@@ -214,24 +231,29 @@ export function VoiceLibraryModal({ open, onClose, onSelect, selectedVoiceId }: 
   if (!open) return null;
 
   return (
-    <div
-      onClick={onClose}
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: "rgba(0,0,0,0.6)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        zIndex: 1000,
-        padding: 24,
-        animation: "fadeIn 0.15s ease",
-      }}
-    >
+    <>
+      <ConfirmDialog request={confirming} onClose={() => setConfirming(null)} />
+      <div
+        onClick={onClose}
+        style={{
+          position: "fixed",
+          inset: 0,
+          background: "rgba(0,0,0,0.6)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          zIndex: 1000,
+          padding: 24,
+          animation: "fadeIn 0.15s ease",
+        }}
+      >
       <audio ref={audioRef} onEnded={() => setPlayingId(null)} />
       <div
         onClick={(e) => e.stopPropagation()}
         className="card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="voice-library-title"
         style={{
           width: "min(920px, 100%)",
           maxHeight: "88vh",
@@ -243,7 +265,7 @@ export function VoiceLibraryModal({ open, onClose, onSelect, selectedVoiceId }: 
       >
         {/* Header */}
         <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "16px 18px", borderBottom: "1px solid var(--border)" }}>
-          <h2 style={{ margin: 0, fontSize: 16 }}>Select a voice</h2>
+          <h2 id="voice-library-title" style={{ margin: 0, fontSize: 16 }}>Select a voice</h2>
           <span className="faint" style={{ fontSize: 12 }}>{filtered.length} voices</span>
           <button className="btn-ghost btn-sm" style={{ marginLeft: "auto" }} onClick={() => setShowAdd((s) => !s)}>
             {showAdd ? "Cancel" : "+ Add a voice"}
@@ -290,12 +312,14 @@ export function VoiceLibraryModal({ open, onClose, onSelect, selectedVoiceId }: 
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
-          <div style={{ display: "flex", gap: 6 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }} aria-label="Voice gender filter">
+            <span className="faint" style={{ fontSize: 11 }}>Gender</span>
             <button style={seg(gender === "all")} onClick={() => setGender("all")}>All</button>
             <button style={seg(gender === "male")} onClick={() => setGender("male")}>Male</button>
             <button style={seg(gender === "female")} onClick={() => setGender("female")}>Female</button>
           </div>
-          <div style={{ display: "flex", gap: 6 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }} aria-label="Voice source filter">
+            <span className="faint" style={{ fontSize: 11 }}>Source</span>
             <button style={seg(source === "all")} onClick={() => setSource("all")}>All</button>
             <button style={seg(source === "saved")} onClick={() => setSource("saved")}>Saved</button>
             <button style={seg(source === "library")} onClick={() => setSource("library")}>Library</button>
@@ -387,6 +411,7 @@ export function VoiceLibraryModal({ open, onClose, onSelect, selectedVoiceId }: 
           )}
         </div>
       </div>
-    </div>
+      </div>
+    </>
   );
 }

@@ -57,12 +57,14 @@ export const SETTING_KEYS = [
 
   // ── Animations (img2vid) ──────────────────────────────────────────
   "ANIMATION_PROVIDER",      // off | 69labs | replicate | fal
-  "ANIMATION_MODEL",         // e.g. veo-video, grok-imagine-video
+  "ANIMATION_MODEL",         // e.g. veo-3.1-fast, grok-imagine-video
   "ANIMATION_RATIO_PERCENT", // 0–100, percentage of scenes to animate
   "ANIMATION_DISTRIBUTION",  // first-half | alternating | random | all
   "ANIMATION_DURATION",      // seconds (provider-dependent)
   "ANIMATION_KEEP_VEO_AUDIO", // "1" to keep Veo's generated ambient audio
+  "CLEAN_PROVIDER_WATERMARK", // "1" to gently reframe generated clips so visible provider corner marks do not show
   "VIDEO_STYLE",             // global video look/mood, appended to every scene's visual_prompt (replaces the legacy animation_motion prompt)
+  "GENERATION_NEGATIVE_PROMPT", // global avoid-list appended to image/video prompts
   "VISUAL_CONTINUITY_MODE",  // off | prompt | keyframe — see src/lib/continuity.ts. Default "prompt".
 
   // ── Video assembly (FFmpeg) ───────────────────────────────────────
@@ -78,6 +80,11 @@ export const SETTING_KEYS = [
   "ANIMATION_CONCURRENCY",   // parallel img2vid jobs
   "ASSEMBLE_CONCURRENCY",    // parallel FFmpeg clip renders
   "ASSEMBLE_XFADE_CHUNKS",   // split final xfade into N parallel chunks (1 = monolithic)
+
+  // ── Hybrid mode (fresh opening + stock-library tail) ──────────────
+  "HYBRID_MODE",             // "1" = first N min are fresh AI clips, the rest are stock-library clips
+  "HYBRID_FRESH_MINUTES",    // minutes of fresh AI at the start (default 5); rest filled from the library
+  "STOCK_LIBRARY_FOLDER",    // Drive subfolder under "Clips Library" to pull stock B-roll from (e.g. "Pirates")
 
   // ── Reliability / scaling ─────────────────────────────────────────
   "FAILURE_THRESHOLD_PERCENT", // 0–100. If more than this % of scenes fail, the run aborts. Default 25.
@@ -174,7 +181,7 @@ export const DEFAULTS: Record<SettingKey, string> = {
   TTS_VOICE_PROVIDER: "elevenlabs",
   TTS_VOICE_ID: "",
   TTS_MODEL: "eleven_multilingual_v2",
-  TTS_SPLIT_TYPE: "smart",
+  TTS_SPLIT_TYPE: "paragraphs",
   TTS_LANGUAGE_BOOST: "English",
 
   // Voice fine-tuning (slightly slower + small style for documentary feel)
@@ -197,15 +204,18 @@ export const DEFAULTS: Record<SettingKey, string> = {
 
   // Animations — Conveyer Hum animates EVERY scene through 69labs.
   ANIMATION_PROVIDER: "69labs",
-  ANIMATION_MODEL: "veo-video",           // Veo 3.1 Fast via 69labs (image-to-video); grok-imagine-video is the legacy option
+  ANIMATION_MODEL: "veo-3.1-fast",        // Faster Veo path via 69labs (image-to-video); grok-imagine-video is the legacy option
   ANIMATION_RATIO_PERCENT: "100",         // 100 % of scenes animated, no Ken-Burns mix
   ANIMATION_DISTRIBUTION: "all",
   ANIMATION_DURATION: "",                 // ignored by Grok (69labs hard-codes ~6s); applies only to non-Grok/non-Veo models
   ANIMATION_KEEP_VEO_AUDIO: "",           // legacy name — applies to any model with embedded audio
+  CLEAN_PROVIDER_WATERMARK: "1",
   // Global video look/mood, appended to every scene's visual_prompt. Darker /
   // slower "sleep content" seed; channels can override per-channel.
   VIDEO_STYLE:
     "Slow cinematic documentary motion, low-key lighting with deep shadows and muted earth tones, soft contrast, no harsh highlights, dreamlike pacing, gentle ambient camera drift, photographic realism with a quiet contemplative atmosphere — feels like a hushed nature documentary at dusk.",
+  GENERATION_NEGATIVE_PROMPT:
+    "no split screen, no collage, no multi-panel layout, no side-by-side frames, no picture-in-picture, no duplicated scenes, no text, no captions, no watermark, no logo, no UI overlay, no bright cheerful lighting unless explicitly requested",
   // Visual continuity between consecutive scenes in the same shot. "prompt"
   // appends the previous scene's identity hint to the next image prompt
   // (no extra paid calls). "keyframe" would chain the previous video's last
@@ -220,11 +230,16 @@ export const DEFAULTS: Record<SettingKey, string> = {
   SCENE_TAIL_SILENCE: "1.0",              // deprecated: continuous-voiceover (no inter-scene gaps); kept for old runs
 
   // Performance
-  IMAGE_CONCURRENCY: "5",
+  IMAGE_CONCURRENCY: "7",
   TTS_CONCURRENCY: "3",
-  ANIMATION_CONCURRENCY: "3",
+  ANIMATION_CONCURRENCY: "5",
   ASSEMBLE_CONCURRENCY: "4",
   ASSEMBLE_XFADE_CHUNKS: "4",
+
+  // Hybrid mode — off by default; opt in per channel/run from the New Run page.
+  HYBRID_MODE: "",
+  HYBRID_FRESH_MINUTES: "1",
+  STOCK_LIBRARY_FOLDER: "Pirates",
 
   // Reliability / scaling
   FAILURE_THRESHOLD_PERCENT: "25",
@@ -250,12 +265,14 @@ export function seedDefaults() {
   }
   forceVideoOnlyMode();
   enableImageKeyframeMode();
+  preferAppControlledTtsChunks();
+  preferFastGenerationModels();
 }
 
 /**
  * One-time correction for users coming from the Hum Conveyer template: force
  * video generation on and animate 100% of scenes on first boot. The video MODEL
- * is left alone — Conveyer Hum defaults to Veo 3.1 Fast (`veo-video`) and Grok
+ * is left alone — Conveyer Hum defaults to Veo 3.1 Fast (`veo-3.1-fast`) and Grok
  * stays a switchable option.
  * Tracked via a flag so we never overwrite a user's later manual choice.
  */
@@ -294,4 +311,44 @@ function enableImageKeyframeMode() {
     upsertStmt.run("IMAGE_PROVIDER", "69labs");
   }
   upsertStmt.run("_migration_image_keyframes_20260528", "1");
+}
+
+/**
+ * 2026-05-31: the app already splits long narration at sentence-safe
+ * boundaries. Asking 69labs to split again with `smart` can re-cut the text in
+ * places we cannot inspect. Use paragraph mode so the app owns the chunking.
+ */
+function preferAppControlledTtsChunks() {
+  const flag = getStmt.get("_migration_tts_paragraph_split_20260531") as { value: string } | undefined;
+  if (flag?.value === "1") return;
+
+  const row = getStmt.get("TTS_SPLIT_TYPE") as { value: string } | undefined;
+  const current = row?.value?.trim().toLowerCase();
+  if (!current || current === "smart") {
+    upsertStmt.run("TTS_SPLIT_TYPE", "paragraphs");
+  }
+  upsertStmt.run("_migration_tts_paragraph_split_20260531", "1");
+}
+
+/**
+ * 2026-05-31: use the faster current 69labs stack by default. Only migrate
+ * empty/known legacy defaults, never a user's explicit custom model id.
+ */
+function preferFastGenerationModels() {
+  const flag = getStmt.get("_migration_fast_models_20260531") as { value: string } | undefined;
+  if (flag?.value === "1") return;
+
+  const imageRow = getStmt.get("IMAGE_MODEL") as { value: string } | undefined;
+  const imageCurrent = imageRow?.value?.trim().toLowerCase();
+  if (!imageCurrent || imageCurrent === "imagen-4" || imageCurrent === "imagen-4-ultra") {
+    upsertStmt.run("IMAGE_MODEL", "nano-banana-pro");
+  }
+
+  const videoRow = getStmt.get("ANIMATION_MODEL") as { value: string } | undefined;
+  const videoCurrent = videoRow?.value?.trim().toLowerCase();
+  if (!videoCurrent || videoCurrent === "grok-imagine-video" || videoCurrent === "veo-3") {
+    upsertStmt.run("ANIMATION_MODEL", "veo-3.1-fast");
+  }
+
+  upsertStmt.run("_migration_fast_models_20260531", "1");
 }

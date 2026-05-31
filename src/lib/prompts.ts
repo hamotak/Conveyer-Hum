@@ -1,25 +1,26 @@
 import db from "./db";
+import { defaultStockFolder } from "./channel-stock";
 import { DEFAULT_STYLE_PRESET_ID, loadStylePreset } from "./style-presets";
 
 export const PROMPT_NAMES = ["scene_split", "image_prompt", "animation_motion"] as const;
 export type PromptName = (typeof PROMPT_NAMES)[number];
 
 export const DEFAULT_PROMPTS: Record<PromptName, string> = {
-  scene_split: `You are a video editor for a faceless YouTube channel. Split the provided script into scenes for an automated AI video pipeline (one short narrated clip per scene).
+  scene_split: `You are a video editor for a faceless YouTube channel. Split the provided script into scenes for an automated AI video pipeline (one narrated visual beat per scene).
 
-HOW TO SPLIT — cut by IDEA, not by sentence:
-  Each scene is ONE complete idea or beat. Read for meaning, not punctuation.
+HOW TO SPLIT — protect the narration first:
+  Each scene is one complete spoken thought. Read for meaning and sentence flow.
 
 SCENE LENGTH:
-- Target: 6–8 seconds of narration per scene (roughly 12–20 words at a calm speaking pace).
-- Hard maximum: 8 seconds (~20 words). Never exceed this.
-- Minimum: 4 seconds (~10 words). A slice shorter than 4 seconds is NOT a complete idea — merge it with a neighbor (merge forward unless that would push the combined scene past 8 seconds, in which case merge backward).
-- A 2–4 word fragment is never its own scene. Always merge fragments.
+- Target: 12–22 seconds of narration per scene (roughly 25–45 words at a calm speaking pace).
+- Two short related sentences SHOULD share one scene when they form one thought.
+- A sentence fragment is never its own scene. Always merge fragments.
+- Do not cut after dangling connector words such as and, but, of, to, the, with, or from.
 
 SENTENCE & CLAUSE RULES:
-- Prefer breaking on sentence boundaries (. ? !) whenever the sentence fits in 6–8 seconds.
-- Two short related sentences MAY share one scene if their combined narration is ≤ 8 seconds.
-- If a SINGLE sentence is longer than 8 seconds, split it at the nearest natural clause boundary, in this priority order: em-dash (—), semicolon (;), colon (:), comma (,). Never split in the middle of a clause or phrase.
+- Prefer breaking on sentence boundaries (. ? !).
+- If one sentence is too long, split only at a natural clause boundary near the middle: em-dash (—), semicolon (;), colon (:), then comma (,).
+- Never split in the middle of a phrase, name, setup/punchline, or descriptive clause.
 
 VERBATIM COVERAGE (critical):
 - Cover the ENTIRE script word-for-word. No omissions, no summarizing, no paraphrasing, no reordering, no punctuation changes.
@@ -28,7 +29,7 @@ VERBATIM COVERAGE (critical):
 For EACH scene, return a JSON object with:
 - "text": the exact verbatim slice of the script for this scene (no edits, no punctuation changes).
 - "visual_prompt": a 40–90-word English description of a single cinematic shot that literally illustrates this scene's text. Describe the subject, the setting, and explicit camera or subject motion (slow push-in, gentle parallax, drifting light, rising mist). Photographic realism. No on-screen text, captions, logos, or watermarks. No recognizable real people or faces in close-up. The channel's overall look (lighting, mood, color grade) is appended automatically afterward — describe SUBSTANCE here, not style.
-- "duration_hint_sec": estimated narration length in seconds (number, 4–8).
+- "duration_hint_sec": estimated narration length in seconds (number, 12–22).
 
 VISUAL CONTINUITY (additional fields — emit honestly; do NOT fake continuity):
 - "continuity_group_id": a short kebab-case slug naming the SHOT IDENTITY (e.g. "ship-charleston-harbor", "blackbeard-deck", "blockade-charleston-1718"). Consecutive scenes that show the SAME subject + same location + same time of day MUST share the same group id. Different subject / different place / major time jump = a NEW group id.
@@ -93,7 +94,7 @@ export interface PromptPreset {
   style_preset_id: string | null;
   /** video style override — appended to every scene's visual_prompt (optional — NULL = preset/global). */
   video_style: string | null;
-  /** video model override (e.g. veo-video) — NULL = global ANIMATION_MODEL. */
+  /** video model override (e.g. veo-3.1-fast) — NULL = global ANIMATION_MODEL. */
   video_model: string | null;
   /** aspect ratio override (e.g. 16:9) — NULL = global IMAGE_RATIO. */
   aspect_ratio: string | null;
@@ -109,6 +110,10 @@ export interface PromptPreset {
   voice_id: string | null;
   /** TTS provider for the per-channel voice (voice-clone | elevenlabs | edgetts). NULL = global TTS_VOICE_PROVIDER. */
   voice_provider: string | null;
+  /** Drive stock folder this channel pulls B-roll from (Hybrid/Stock Cut). NULL = global STOCK_LIBRARY_FOLDER. */
+  stock_folder: string | null;
+  /** Minutes of fresh AI at the start in Hybrid mode. NULL = global HYBRID_FRESH_MINUTES. */
+  hybrid_fresh_minutes: number | null;
   /** @deprecated scene-end pause — continuous voiceover has no inter-scene gaps */
   scene_end_pause_seconds: number | null;
   /** @deprecated legacy animation_motion override — superseded by video_style */
@@ -135,10 +140,12 @@ export interface PromptPresetInput {
   voice_style?: number | null;
   voice_id?: string | null;
   voice_provider?: string | null;
+  stock_folder?: string | null;
+  hybrid_fresh_minutes?: number | null;
 }
 
 const PRESET_COLS =
-  "id, name, content, description, style_preset_id, video_style, video_model, aspect_ratio, voice_speed, voice_stability, voice_similarity_boost, voice_style, voice_id, voice_provider, animation_motion, image_prompt, created_at, updated_at";
+  "id, name, content, description, style_preset_id, video_style, video_model, aspect_ratio, voice_speed, voice_stability, voice_similarity_boost, voice_style, voice_id, voice_provider, stock_folder, hybrid_fresh_minutes, animation_motion, image_prompt, created_at, updated_at";
 
 const listPresetsStmt = db.prepare(
   `SELECT ${PRESET_COLS} FROM prompt_presets ORDER BY name COLLATE NOCASE ASC`
@@ -146,10 +153,10 @@ const listPresetsStmt = db.prepare(
 const getPresetStmt = db.prepare(`SELECT ${PRESET_COLS} FROM prompt_presets WHERE id = ?`);
 const getPresetByNameStmt = db.prepare(`SELECT ${PRESET_COLS} FROM prompt_presets WHERE name = ?`);
 const createPresetStmt = db.prepare(
-  "INSERT INTO prompt_presets (name, content, description, style_preset_id, video_style, video_model, aspect_ratio, voice_speed, voice_stability, voice_similarity_boost, voice_style, voice_id, voice_provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  "INSERT INTO prompt_presets (name, content, description, style_preset_id, video_style, video_model, aspect_ratio, voice_speed, voice_stability, voice_similarity_boost, voice_style, voice_id, voice_provider, stock_folder, hybrid_fresh_minutes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 );
 const updatePresetStmt = db.prepare(
-  "UPDATE prompt_presets SET name = ?, content = ?, description = ?, style_preset_id = ?, video_style = ?, video_model = ?, aspect_ratio = ?, voice_speed = ?, voice_stability = ?, voice_similarity_boost = ?, voice_style = ?, voice_id = ?, voice_provider = ?, updated_at = datetime('now') WHERE id = ?"
+  "UPDATE prompt_presets SET name = ?, content = ?, description = ?, style_preset_id = ?, video_style = ?, video_model = ?, aspect_ratio = ?, voice_speed = ?, voice_stability = ?, voice_similarity_boost = ?, voice_style = ?, voice_id = ?, voice_provider = ?, stock_folder = ?, hybrid_fresh_minutes = ?, updated_at = datetime('now') WHERE id = ?"
 );
 const deletePresetStmt = db.prepare("DELETE FROM prompt_presets WHERE id = ?");
 
@@ -204,7 +211,9 @@ export function createPromptPreset(input: PromptPresetInput): number {
     normalizeNumber(input.voice_similarity_boost),
     normalizeNumber(input.voice_style),
     normalizeOptional(input.voice_id),
-    normalizeOptional(input.voice_provider)
+    normalizeOptional(input.voice_provider),
+    normalizeOptional(input.stock_folder) ?? defaultStockFolder(trimmedName),
+    normalizeNumber(input.hybrid_fresh_minutes)
   );
   return Number(result.lastInsertRowid);
 }
@@ -226,6 +235,8 @@ export function updatePromptPreset(id: number, input: PromptPresetInput): void {
     normalizeNumber(input.voice_style),
     normalizeOptional(input.voice_id),
     normalizeOptional(input.voice_provider),
+    normalizeOptional(input.stock_folder),
+    normalizeNumber(input.hybrid_fresh_minutes),
     id
   );
   if (result.changes === 0) throw new Error(`Channel profile id=${id} not found`);

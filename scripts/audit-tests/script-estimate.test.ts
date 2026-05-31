@@ -31,7 +31,7 @@ console.log("Test 2 — a normal ~3 min script is NOT blocked:");
 {
   const e = estimateScript(450); // 450/150 = 3 min
   check("~3 min not long", e.isLong === false);
-  check("~3 min ≈ 36 scenes (< 40)", e.scenes < LONG_SCENES);
+  check("~3 min stays under the long-scene threshold", e.scenes < LONG_SCENES);
 }
 
 console.log("Test 3 — long by minutes (≥20 min):");
@@ -45,8 +45,9 @@ console.log("Test 3 — long by minutes (≥20 min):");
 
 console.log("Test 4 — long by scene count crosses before 20 min:");
 {
-  // 40 scenes × 5s = 200s ≈ 3.3 min, but scene count alone should flag it.
-  const wordsFor40Scenes = Math.ceil((LONG_SCENES * 5 * WPM) / 60);
+  // 40 scenes × 16s ≈ 10.7 min, but scene count alone should still flag it.
+  const secondsPerScene = 16;
+  const wordsFor40Scenes = Math.ceil((LONG_SCENES * secondsPerScene * WPM) / 60);
   const e = estimateScript(wordsFor40Scenes);
   check("≥40 scenes → isLong even though under 20 min", e.isLong === true && e.minutes < LONG_MINUTES);
 }

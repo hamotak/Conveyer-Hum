@@ -2,12 +2,12 @@
  * Script length estimation + long-run warnings — dependency-free so it powers
  * both the Video page stats and the preflight check, and can be unit-tested.
  *
- * Narration pace is ~150 words/min; the pipeline cuts ~5s scenes. A run is
+ * Narration pace is ~150 words/min; the pipeline cuts ~16s scenes. A run is
  * flagged "long" past 40 scenes OR 20 minutes — that's where one-shot runs get
  * risky and a chaptered approach is safer.
  */
 export const WORDS_PER_MINUTE = 150;
-export const SECONDS_PER_SCENE = 5;
+export const SECONDS_PER_SCENE = 16;
 export const LONG_SCENES = 40;
 export const LONG_MINUTES = 20;
 

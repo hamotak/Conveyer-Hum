@@ -2,10 +2,12 @@
   "name": "conveyer-hum",
   "version": "0.1.0",
   "private": true,
-  "description": "Local toolkit for AI faceless YouTube videos — two modes (Video Conveyer, Re-assembly) on Veo 3.1 text-to-video + ElevenLabs voiceover, both via 69labs.",
+  "description": "Local toolkit for AI faceless YouTube videos — image keyframes to Veo 3.1 Fast video with ElevenLabs voiceover via 69labs.",
   "scripts": {
-    "dev": "next dev",
+    "predev": "node scripts/clean-next.mjs",
+    "dev": "next dev --webpack",
     "build": "next build",
+    "lint": "tsc --noEmit",
     "start": "next start",
     "test": "node scripts/audit-tests/run-all.mjs",
     "postinstall": "node scripts/fix-native-binaries.mjs",
@@ -27,6 +29,7 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "@tailwindcss/postcss": "^4",
     "@types/better-sqlite3": "^7.6.13",
     "@types/fluent-ffmpeg": "^2.1.27",

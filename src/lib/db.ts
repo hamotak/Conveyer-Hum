@@ -154,5 +154,11 @@ tryAddColumn("runs", "preset_aspect_ratio TEXT");
 tryAddColumn("runs", "preset_voice_stability REAL");
 tryAddColumn("runs", "preset_voice_similarity_boost REAL");
 tryAddColumn("runs", "preset_voice_style REAL");
+// Per-channel stock library folder + hybrid fresh-minutes (so the New Video page
+// needs no per-run knobs — the channel owns them). Snapshotted onto each run.
+tryAddColumn("prompt_presets", "stock_folder TEXT");
+tryAddColumn("prompt_presets", "hybrid_fresh_minutes REAL");
+tryAddColumn("runs", "preset_stock_folder TEXT");
+tryAddColumn("runs", "preset_hybrid_fresh_minutes REAL");
 
 export default db;

@@ -36,19 +36,21 @@ export interface Group {
 
 export const ALL_GROUPS: Group[] = [
   {
-    title: "Required API Keys",
-    subtitle: "The bare minimum needed to run the pipeline. Without these keys, nothing works.",
+    title: "Main connections",
+    subtitle: "The two services the app needs before it can create videos.",
     required: true,
     fields: [
       {
         key: "GOOGLE_API_KEY",
-        desc: "Powers scene splitting — Gemini reads your script and breaks it into individual scenes with visual prompts.",
+        label: "Script reader key",
+        desc: "Lets Gemini read your script and turn it into clear video scenes.",
         examples: "Get it free at https://aistudio.google.com/app/apikey (Create API key)",
         required: true,
       },
       {
         key: "LABS69_API_KEY",
-        desc: "One key for BOTH video generation and ElevenLabs voiceover through 69labs.vip — no separate TTS account needed.\n\nPRO TIP: You can paste multiple keys from different 69labs accounts (one per line, or comma-separated). Each account adds another 5 parallel video jobs to the pool. With 3 keys, generation is roughly 3× faster. The platform automatically balances jobs across all keys.",
+        label: "Video and voice key",
+        desc: "Creates the AI video clips and the ElevenLabs voiceover through 69labs. You can paste more than one key to run more jobs at the same time.",
         examples: "Single key: vk_abc... · Multiple keys: paste each on its own line. Each starts with vk_",
         required: true,
         multiline: true,
@@ -57,32 +59,36 @@ export const ALL_GROUPS: Group[] = [
   },
   {
     title: "Storage Location",
-    subtitle: "Where the generated audio and final videos are saved on disk.",
+    subtitle: "Where generated files are saved on this computer.",
     fields: [
       {
         key: "RUNS_OUTPUT_DIR",
-        desc: "Absolute folder path for run outputs. Leave empty to use the default location inside your user profile (~/.conveyer-hum/runs). The settings database itself stays in the default location regardless.",
+        label: "Runs folder",
+        desc: "Leave empty to use the default local runs folder. Change this only if you want videos saved somewhere specific.",
         examples: "Mac: /Users/you/Documents/Conveyer-Runs  ·  Windows: D:\\YouTube\\Conveyer-Runs",
       },
       {
         key: "FFMPEG_PATH",
-        desc: "Absolute path to the FFmpeg binary. Only needed if FFmpeg is not in your system PATH. The platform requires FFmpeg for video assembly.",
+        label: "FFmpeg path",
+        desc: "Only needed if the app cannot find FFmpeg automatically.",
         examples: "Mac: /opt/homebrew/bin/ffmpeg  ·  Windows: C:\\ffmpeg\\bin\\ffmpeg.exe  ·  Leave empty if `ffmpeg` works in your terminal",
       },
     ],
   },
   {
     title: "Script Breakdown (LLM)",
-    subtitle: "How your script gets divided into scenes, and which language model does the splitting.",
+    subtitle: "How the app divides a long script into usable scenes.",
     fields: [
       {
         key: "SCENE_SPLIT_PROVIDER",
-        desc: "Which LLM service splits your script into scenes. Gemini is cheap and fast (recommended). Claude is more thorough but costs more.",
+        label: "Scene reader",
+        desc: "Gemini is the recommended fast, cheap option. Claude can be used when you want a slower, more detailed read.",
         examples: "google  or  anthropic",
       },
       {
         key: "SCENE_SPLIT_MODEL",
-        desc: "Specific model id. For Google, the `-latest` alias auto-tracks the current stable Flash. For Anthropic use the full model id.",
+        label: "Reader model",
+        desc: "The exact model used for scene splitting. The default tracks the current stable Gemini Flash model.",
         examples: "gemini-flash-latest, gemini-2.5-flash, gemini-2.5-pro",
       },
     ],
@@ -92,12 +98,12 @@ export const ALL_GROUPS: Group[] = [
     // now live on each channel (and the New Run inline card). Only the technical
     // engine/model settings stay here as global defaults.
     title: "Voice engine",
-    subtitle: "Global voiceover engine + model. Pick the actual voice, speed and tuning on each channel (or the New Run page).",
+    subtitle: "Global voiceover engine. Pick the actual voice on each channel.",
     fields: [
       {
         key: "TTS_PROVIDER",
         label: "TTS engine",
-        desc: "Which engine generates the voiceover. The recommended option runs ElevenLabs through your existing 69labs key — no extra account needed. The other options call ElevenLabs / OpenAI directly (each needs its own API key), or use the legacy engine.",
+        desc: "Recommended: ElevenLabs through your existing 69labs key, so you do not need another account.",
         options: [
           { value: "69labs", label: "ElevenLabs via 69labs (recommended — no extra key needed)" },
           { value: "elevenlabs", label: "ElevenLabs direct (requires separate ElevenLabs API key)" },
@@ -108,51 +114,71 @@ export const ALL_GROUPS: Group[] = [
       {
         key: "TTS_MODEL",
         label: "ElevenLabs model",
-        desc: "eleven_multilingual_v2 is a good default. Other models from ElevenLabs may also work.",
+        desc: "The default is a strong all-purpose ElevenLabs model.",
         examples: "eleven_multilingual_v2 (default)",
       },
       {
         key: "TTS_LANGUAGE_BOOST",
         label: "Language boost",
-        desc: "Tells the voice engine which language to optimise pronunciation for. `auto` lets the engine detect it.",
+        desc: "Helps pronunciation. Use auto when the script language changes or you are unsure.",
         examples: "English (default)  ·  Spanish  ·  French  ·  auto",
       },
     ],
   },
   {
     title: "Video output",
-    subtitle: "Global video provider + audio. Each fresh scene is generated as image first, then image-to-video. Pick model, style and aspect ratio on each channel (or the New Run page).",
+    subtitle: "Global video engine settings. Style and aspect ratio live on each channel.",
     fields: [
       {
         key: "ANIMATION_PROVIDER",
-        desc: "Service for image-to-video generation. `69labs` (default) routes to the chosen model. `replicate` / `fal` open the door to Kling, Luma, etc. Do not set to `off` — Conveyer Hum needs a video provider.",
+        label: "Video engine",
+        desc: "Keep this on 69labs for the main workflow.",
         examples: "69labs  (default)  ·  replicate  ·  fal",
       },
       {
         key: "ANIMATION_KEEP_VEO_AUDIO",
         label: "Keep model ambient audio",
-        desc: "Whether to keep the ambient audio the video model bakes into each clip. Default empty — we mute it so only the voiceover is heard. Set `1` to layer the model's atmospheric sound behind the narrator.",
+        desc: "Leave empty for clean narration. Set to 1 only if you want the video model's background audio under the voiceover.",
         examples: "empty = mute (default)  ·  1 = keep ambient audio",
+      },
+      {
+        key: "CLEAN_PROVIDER_WATERMARK",
+        label: "Clean corner mark",
+        desc: "Veo can add a small corner mark. Keep this on so generated clips are gently reframed before final assembly and Drive upload.",
+        options: [
+          { value: "1", label: "On (recommended)" },
+          { value: "0", label: "Off" },
+        ],
+      },
+      {
+        key: "GENERATION_NEGATIVE_PROMPT",
+        label: "Always avoid",
+        desc: "Global negative prompt for generated images and image-to-video clips. Use this to block split screens, collages, text, logos, and visual styles you never want.",
+        examples: "no split screen, no collage, no multi-panel layout, no side-by-side frames, no picture-in-picture, no text, no logos, no bright cheerful lighting unless explicitly requested",
+        multiline: true,
       },
     ],
   },
   {
     title: "Video Assembly (FFmpeg)",
-    subtitle: "Final stitching step. Controls output resolution, framerate, and how scenes transition into each other.",
+    subtitle: "The final stitching step: size, frame rate, and transitions.",
     fields: [
       {
         key: "VIDEO_RESOLUTION",
-        desc: "Final video resolution. 1920x1080 (1080p) is the YouTube standard. Source clips are scaled to fit.",
+        label: "Final resolution",
+        desc: "1920x1080 is the normal YouTube 1080p choice.",
         examples: "1920x1080, 1280x720, 3840x2160",
       },
       {
         key: "VIDEO_FPS",
-        desc: "Frames per second. 24 is cinematic. 30 is YouTube standard. 60 doubles render time and file size.",
+        label: "Frame rate",
+        desc: "24 feels cinematic. 30 is the common YouTube default. 60 is heavier and slower.",
         examples: "24, 30, 60",
       },
       {
         key: "TRANSITION_DURATION",
-        desc: "Crossfade length between scenes in seconds. 0.5 is a gentle blend. 1.0 is more cinematic and smooths over short clips. 0 disables transitions (instant cuts — faster to render but abrupt).",
+        label: "Crossfade length",
+        desc: "0.5 is a gentle blend. 1.0 is smoother. 0 makes hard cuts.",
         examples: "0.5 = smooth  ·  1.0 = cinematic  ·  0 = no transitions",
       },
       // SCENE_TAIL_SILENCE removed from UI — deprecated: continuous-voiceover
@@ -161,42 +187,48 @@ export const ALL_GROUPS: Group[] = [
   },
   {
     title: "Performance (Concurrency)",
-    subtitle: "How many parallel jobs and FFmpeg renders to run at once. Higher = faster but risks rate limits. Defaults are tuned for 69labs's limits.",
+    subtitle: "How much work the app tries to do at the same time.",
     fields: [
       {
         key: "TTS_CONCURRENCY",
-        desc: "Simultaneous TTS jobs PER 69labs key. With multiple keys, total = this × number of keys.",
+        label: "Voice jobs at once",
+        desc: "Higher can be faster, but too high may hit provider limits.",
         examples: "default 3  ·  bump to 5–7 on higher-tier plans",
       },
       {
         key: "ANIMATION_CONCURRENCY",
-        desc: "Simultaneous video jobs PER 69labs key. 69labs's hard limit is 5 per account. Default 3 leaves retry headroom. Total = this × number of keys. Lower this to 2 if you see lots of 429 'Too many requests' errors.",
-        examples: "default 3  ·  max 5 per 69labs account",
+        label: "Video jobs at once",
+        desc: "The app now reads 69labs live capacity and waits when slots are full.",
+        examples: "default 5  ·  max 5 per 69labs account",
       },
       {
         key: "ASSEMBLE_CONCURRENCY",
-        desc: "How many FFmpeg clip renders happen in parallel. CPU-bound — set roughly to half your CPU core count.",
+        label: "Assembly jobs at once",
+        desc: "Controls local FFmpeg work. Higher uses more CPU.",
         examples: "default 4  ·  raise on 8+ core CPUs",
       },
       {
         key: "ASSEMBLE_XFADE_CHUNKS",
-        desc: "Splits the final crossfade pass into N parallel chunks, then crossfades the chunks together. Massively speeds up assembly for long videos (100+ scenes). Set to 1 to disable. Auto-skipped for short videos (fewer than 3×chunks scenes).",
+        label: "Long-video assembly chunks",
+        desc: "Speeds up very long videos by stitching sections in parallel. Use 1 to turn it off.",
         examples: "1 = no chunking  ·  4 = default  ·  6-8 for 16+ core CPUs",
       },
     ],
   },
   {
     title: "Reliability & Scaling",
-    subtitle: "How tolerant a run is of failures, and the confidence bar for Auto library reuse. Matters most at high volume on unreliable nights.",
+    subtitle: "Recovery behavior for big runs and library reuse.",
     fields: [
       {
         key: "FAILURE_THRESHOLD_PERCENT",
-        desc: "If more than this percentage of scenes fail, the whole run aborts. Default 25. On unreliable nights (provider glitches) raise it to 60-70 so a partial run survives — you can then Resume it from the run page to regenerate only the missing scenes instead of losing everything.",
+        label: "Failure tolerance",
+        desc: "If providers are flaky, raising this lets a partial run survive so Resume can fill the missing parts later.",
         examples: "25 = default (strict)  ·  60-70 = tolerant (keep partial runs)  ·  100 = never abort",
       },
       {
         key: "AUTO_REUSE_THRESHOLD",
-        desc: "Confidence percentage for Auto reuse. When a run is in Auto reuse mode (chosen per run on the New Run page), a scene is reused only if its best library match scores at or above this. Higher = stricter (fewer but safer reuses).",
+        label: "Reuse strictness",
+        desc: "Higher means fewer but safer reused clips. Lower means more reuse and more risk of a mismatched clip.",
         examples: "80 = default  ·  90 = very strict  ·  70 = aggressive reuse",
       },
     ],

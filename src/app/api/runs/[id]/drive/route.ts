@@ -1,6 +1,4 @@
 import { NextResponse } from "next/server";
-import fs from "node:fs";
-import path from "node:path";
 import db from "@/lib/db";
 import { ensureInit } from "@/lib/init";
 import { log } from "@/lib/logger";
@@ -8,6 +6,7 @@ import { getRunDir } from "@/lib/run-paths";
 import { getConnectionStatus } from "@/lib/services/gdrive";
 import { countRawClipsOnDisk } from "@/lib/services/scene-assets-disk";
 import { rebuildSceneAssetsFromDisk, syncRunToDrive } from "@/lib/services/run-upload";
+import { readRunExportState } from "@/lib/run-export-state";
 
 interface DriveStatus {
   syncEnabled: boolean;          // is Drive auto-sync turned on at all
@@ -23,7 +22,7 @@ interface DriveStatus {
 }
 
 const getRun = db.prepare(
-  "SELECT id, folder_name, drive_clips_folder_id, drive_final_video_id, drive_synced_at FROM runs WHERE id = ?"
+  "SELECT id, status, folder_name, drive_clips_folder_id, drive_final_video_id, drive_synced_at FROM runs WHERE id = ?"
 );
 
 function buildLinks(clipsFolderId?: string | null, finalVideoId?: string | null) {
@@ -45,6 +44,7 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
   const row = getRun.get(id) as
     | {
         id: string;
+        status: string;
         folder_name: string | null;
         drive_clips_folder_id: string | null;
         drive_final_video_id: string | null;
@@ -70,7 +70,7 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
     clipsFolderId: row.drive_clips_folder_id ?? undefined,
     finalVideoId: row.drive_final_video_id ?? undefined,
     ...buildLinks(row.drive_clips_folder_id, row.drive_final_video_id),
-    canRetry: rawClipsRemainCount > 0 && fs.existsSync(path.join(runDir, "final.mp4")),
+    canRetry: rawClipsRemainCount > 0 && readRunExportState(id, "done").finalReady,
     rawClipsRemainCount,
   };
 
@@ -91,7 +91,7 @@ export async function POST(_req: Request, ctx: { params: Promise<{ id: string }>
   ensureInit();
   const { id } = await ctx.params;
 
-  const row = getRun.get(id) as { id: string; folder_name: string | null } | undefined;
+  const row = getRun.get(id) as { id: string; status: string; folder_name: string | null } | undefined;
   if (!row) {
     return NextResponse.json({ error: "Run not found" }, { status: 404 });
   }
@@ -105,11 +105,22 @@ export async function POST(_req: Request, ctx: { params: Promise<{ id: string }>
   }
 
   const runDir = getRunDir(id);
-  const finalPath = path.join(runDir, "final.mp4");
-  if (!fs.existsSync(finalPath)) {
+  const exportState = readRunExportState(id, row.status);
+  const finalPath = exportState.finalPath;
+  if (!exportState.finalFileExists) {
     return NextResponse.json(
       { error: "Final video not found on disk — cannot sync." },
       { status: 400 }
+    );
+  }
+  if (!exportState.finalReady) {
+    return NextResponse.json(
+      {
+        error: exportState.finalNeedsRepair
+          ? "Final video needs chunk repair before Drive sync."
+          : "Final video is not export-ready yet.",
+      },
+      { status: 409 }
     );
   }
 

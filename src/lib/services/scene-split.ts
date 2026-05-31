@@ -5,12 +5,21 @@ import { getSetting } from "../settings";
 import { getPrompt } from "../prompts";
 import { log } from "../logger";
 import { getRunDir } from "../run-paths";
+import { WORDS_PER_MINUTE } from "../script-estimate";
+import { chunkTextByNarrationUnits, splitIntoNarrationUnits } from "../text-chunking";
+import {
+  GENERATED_SCENE_MAX_SECONDS,
+  estimateGeneratedSceneSeconds,
+  normalizeNarrationScenes,
+  validateFreshOpeningScenes,
+} from "../scene-chunking";
 
 export interface Scene {
   index: number;
   text: string;
   visual_prompt: string;
   duration_hint_sec: number;
+  source_kind?: "fresh" | "stock";
   /** Visual continuity (optional, added 2026-05-28). All three are emitted by
    *  the LLM when the scene-split prompt asks for them; older scenes.json files
    *  lack them and the planner falls back to "fresh shot per scene". */
@@ -34,6 +43,15 @@ export interface Scene {
  * so coverage stays clean and no scene is born torn-in-two.
  */
 const WORDS_PER_CHUNK = 3000;
+const STOCK_TAIL_TARGET_WORDS = Math.round((16 / 60) * WORDS_PER_MINUTE);
+const STOCK_TAIL_MAX_WORDS = Math.round((22 / 60) * WORDS_PER_MINUTE);
+
+export interface HybridScriptPlan {
+  scenes: Scene[];
+  freshSceneCount: number;
+  freshText: string;
+  tailText: string;
+}
 
 /**
  * Splits the script into scenes. Supports Google Gemini (default, cheap) and
@@ -66,7 +84,7 @@ export async function splitScript(
     rawScenes = await processChunk(provider, systemPrompt, script, 0, runId);
   } else {
     // Long script — split at sentence boundaries and scene-split each chunk.
-    const chunks = chunkScript(script, WORDS_PER_CHUNK);
+    const chunks = chunkTextByNarrationUnits(script, { targetWords: WORDS_PER_CHUNK });
     log(
       runId,
       "info",
@@ -95,9 +113,10 @@ export async function splitScript(
     }
   }
 
-  // Apply the Grok 6-second guard AFTER all chunks are combined — enforce
-  // and re-index in one pass over the full scene list.
-  const scenes = enforceMaxSceneLength(rawScenes);
+  // Apply narration-safe normalization AFTER all chunks are combined. The LLM
+  // may still return tiny shot fragments; this rebuilds the scene text from the
+  // original order into sentence-first narration beats.
+  const scenes = normalizeNarrationScenes(rawScenes);
 
   // Coverage check: words in scene.text vs original script. <70% means the
   // model summarized; we warn but still return what we got.
@@ -152,7 +171,7 @@ export async function splitScriptPreview(
   if (totalWords <= WORDS_PER_CHUNK) {
     rawScenes = await processChunk(provider, systemPrompt, script, 0, null);
   } else {
-    const chunks = chunkScript(script, WORDS_PER_CHUNK);
+    const chunks = chunkTextByNarrationUnits(script, { targetWords: WORDS_PER_CHUNK });
     rawScenes = [];
     for (const chunk of chunks) {
       const chunkScenes = await processChunk(provider, systemPrompt, chunk, rawScenes.length, null);
@@ -160,7 +179,275 @@ export async function splitScriptPreview(
     }
   }
 
-  return enforceMaxSceneLength(rawScenes);
+  return normalizeNarrationScenes(rawScenes);
+}
+
+export async function splitHybridScript(
+  runId: string,
+  script: string,
+  freshSeconds: number,
+  overrideSystemPrompt?: string
+): Promise<HybridScriptPlan> {
+  const provider = (getSetting("SCENE_SPLIT_PROVIDER") || "google").toLowerCase();
+  const systemPrompt = overrideSystemPrompt?.trim() ? overrideSystemPrompt : getPrompt("scene_split");
+  const { freshText, tailText } = splitScriptAtNarrationDuration(script, freshSeconds);
+
+  log(runId, "info", `Planning hybrid script: ${freshSeconds > 0 ? `${Math.round(freshSeconds)}s Fresh AI opening` : "stock-only"} + stock tail`, {
+    stage: "scene_split",
+    data: {
+      freshWords: wordCount(freshText),
+      tailWords: wordCount(tailText),
+      aiPlannerScope: "fresh_opening_only",
+    },
+  });
+
+  const freshScenes = freshText
+    ? await splitFreshOpening(provider, systemPrompt, freshText, runId)
+    : [];
+  const tailScenes = buildStockTailScenes(tailText, freshScenes.length);
+  const scenes = [...freshScenes, ...tailScenes];
+
+  log(
+    runId,
+    "success",
+    `Hybrid script plan ready: ${freshScenes.length} Fresh AI chunk${freshScenes.length === 1 ? "" : "s"} + stock tail${tailScenes.length ? ` (${tailScenes.length} internal beats)` : ""}`,
+    {
+      stage: "scene_split",
+      data: {
+        freshSceneCount: freshScenes.length,
+        stockBeatCount: tailScenes.length,
+        scenes: freshScenes.slice(0, 5).map((s) => ({ i: s.index, text: s.text.slice(0, 80) })),
+      },
+    }
+  );
+
+  return {
+    scenes,
+    freshSceneCount: freshScenes.length,
+    freshText,
+    tailText,
+  };
+}
+
+async function splitFreshOpening(
+  provider: string,
+  stylePrompt: string,
+  freshText: string,
+  runId: string
+): Promise<Scene[]> {
+  let rawScenes = await processFreshOpeningChunk(provider, stylePrompt, freshText, runId);
+  let scenes = finalizeFreshScenes(rawScenes);
+  let validation = validateFreshOpeningScenes(scenes, freshText);
+
+  if (!validation.ok) {
+    log(runId, "warn", `Fresh AI chunk planner needs repair: ${validation.errors.slice(0, 3).join(" ")}`, {
+      stage: "scene_split",
+      data: { errors: validation.errors },
+    });
+    rawScenes = await processFreshOpeningChunk(provider, stylePrompt, freshText, runId, validation.errors);
+    scenes = finalizeFreshScenes(rawScenes);
+    validation = validateFreshOpeningScenes(scenes, freshText);
+  }
+
+  if (!validation.ok) {
+    log(runId, "warn", `Fresh AI chunk planner failed validation after repair; using deterministic fallback. ${validation.errors.slice(0, 3).join(" ")}`, {
+      stage: "scene_split",
+      data: { errors: validation.errors },
+    });
+    return fallbackFreshOpeningScenes(freshText);
+  }
+
+  return scenes;
+}
+
+async function processFreshOpeningChunk(
+  provider: string,
+  stylePrompt: string,
+  freshText: string,
+  runId: string,
+  repairErrors?: string[]
+): Promise<Scene[]> {
+  const prompt = buildFreshOpeningPrompt(stylePrompt, repairErrors);
+  const raw =
+    provider === "google"
+      ? await splitWithGemini(prompt, freshText, { thinkingBudget: 512 })
+      : provider === "anthropic"
+        ? await splitWithClaude(prompt, freshText)
+        : (() => {
+            throw new Error(`Unknown SCENE_SPLIT_PROVIDER: ${provider}`);
+          })();
+
+  let json: unknown;
+  try {
+    json = extractJson(raw);
+  } catch (e) {
+    try {
+      const runDir = getRunDir(runId);
+      fs.mkdirSync(runDir, { recursive: true });
+      fs.writeFileSync(path.join(runDir, `fresh_chunk_plan_raw_${Date.now()}.txt`), raw, "utf-8");
+    } catch {}
+    throw e;
+  }
+  if (!Array.isArray(json)) throw new Error("fresh chunk planner: model did not return a JSON array");
+
+  return (json as Record<string, unknown>[]).map((s, i) => ({
+    index: i,
+    text: String(s.text ?? ""),
+    visual_prompt: String(s.visual_prompt ?? ""),
+    duration_hint_sec: Number(s.duration_hint_sec ?? 6),
+    source_kind: "fresh",
+    continuity_group_id: typeof s.continuity_group_id === "string" ? s.continuity_group_id : null,
+    continuity_break: i === 0 || s.continuity_break === true,
+    continuity_hint: typeof s.continuity_hint === "string" ? s.continuity_hint : null,
+  }));
+}
+
+function buildFreshOpeningPrompt(stylePrompt: string, repairErrors?: string[]): string {
+  return [
+    "You are planning the Fresh AI opening for an AI-video generator.",
+    "Return ONLY a JSON array. Each item must include: text, visual_prompt, duration_hint_sec.",
+    `Each chunk must be a natural narration beat estimated at ${GENERATED_SCENE_MAX_SECONDS} seconds or less. Target 5-7 seconds.`,
+    "Preserve the script text exactly and in order. Do not summarize, paraphrase, duplicate, omit, or reorder words.",
+    "Prefer sentence and clause boundaries. Never end a chunk on a connector or dangling word such as with, their, across, from, and, the, to, or of.",
+    "Never start a chunk with a connector or orphaned phrase such as across the water.",
+    "If a sentence is too long, split at a meaningful clause boundary so both sides sound natural when narrated.",
+    "Write visual_prompt as one cinematic shot for that exact narration beat. No text, captions, logos, watermarks, or UI overlays.",
+    repairErrors?.length
+      ? `Repair these validation issues from the previous attempt: ${repairErrors.join(" ")}`
+      : "",
+    "Style guidance for visual prompts:",
+    stylePrompt,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function finalizeFreshScenes(rawScenes: Scene[]): Scene[] {
+  return rawScenes
+    .filter((s) => s.text.trim())
+    .map((s, i) => ({
+      ...s,
+      index: i,
+      text: s.text.trim().replace(/\s+/g, " "),
+      visual_prompt: s.visual_prompt.trim(),
+      duration_hint_sec: estimateGeneratedSceneSeconds(wordCount(s.text)),
+      source_kind: "fresh",
+      continuity_break: i === 0 ? true : !!s.continuity_break,
+      continuity_group_id: s.continuity_group_id ?? null,
+      continuity_hint: s.continuity_hint ?? null,
+    }));
+}
+
+function fallbackFreshOpeningScenes(freshText: string): Scene[] {
+  return normalizeNarrationScenes([
+    {
+      index: 0,
+      text: freshText,
+      visual_prompt: "Cinematic documentary-style opening shot for the Fresh AI narration.",
+      duration_hint_sec: GENERATED_SCENE_MAX_SECONDS,
+      source_kind: "fresh",
+      continuity_break: true,
+    },
+  ]).map((s, i) => ({
+    ...s,
+    index: i,
+    source_kind: "fresh",
+    duration_hint_sec: estimateGeneratedSceneSeconds(wordCount(s.text)),
+  }));
+}
+
+function buildStockTailScenes(tailText: string, startIndex: number): Scene[] {
+  if (!tailText.trim()) return [];
+  return chunkTextByNarrationUnits(tailText, {
+    targetWords: STOCK_TAIL_TARGET_WORDS,
+    maxWords: STOCK_TAIL_MAX_WORDS,
+  }).map((text, i) => ({
+    index: startIndex + i,
+    text,
+    visual_prompt: `Use channel stock B-roll that supports this narration beat: "${text.slice(0, 220)}"`,
+    duration_hint_sec: estimateStockTailSeconds(wordCount(text)),
+    source_kind: "stock",
+    continuity_break: i === 0,
+    continuity_group_id: null,
+    continuity_hint: null,
+  }));
+}
+
+function splitScriptAtNarrationDuration(script: string, freshSeconds: number): { freshText: string; tailText: string } {
+  const clean = compact(script);
+  if (!clean) return { freshText: "", tailText: "" };
+  if (!Number.isFinite(freshSeconds) || freshSeconds <= 0) return { freshText: "", tailText: clean };
+
+  const targetWords = Math.max(1, Math.round((freshSeconds / 60) * WORDS_PER_MINUTE));
+  const totalWords = wordCount(clean);
+  if (totalWords <= targetWords) return { freshText: clean, tailText: "" };
+
+  const units = splitIntoNarrationUnits(clean);
+  const freshParts: string[] = [];
+  const tailParts: string[] = [];
+  let acc = 0;
+  let cut = false;
+
+  for (const unit of units.length ? units : [clean]) {
+    if (cut) {
+      tailParts.push(unit);
+      continue;
+    }
+
+    const unitWords = wordCount(unit);
+    if (acc + unitWords <= targetWords) {
+      freshParts.push(unit);
+      acc += unitWords;
+      continue;
+    }
+
+    const remaining = targetWords - acc;
+    const [head, tail] = splitTextByWordsAtNaturalCut(unit, remaining);
+    if (head) freshParts.push(head);
+    if (tail) tailParts.push(tail);
+    cut = true;
+  }
+
+  return { freshText: compact(freshParts.join(" ")), tailText: compact(tailParts.join(" ")) };
+}
+
+function splitTextByWordsAtNaturalCut(text: string, targetWords: number): [string, string] {
+  const words = text.match(/\S+/g) ?? [];
+  if (words.length === 0) return ["", ""];
+  if (targetWords <= 0) return ["", text.trim()];
+  if (words.length <= targetWords) return [text.trim(), ""];
+  const cut = findNaturalWordCut(words, targetWords);
+  return [words.slice(0, cut).join(" "), words.slice(cut).join(" ")];
+}
+
+function findNaturalWordCut(words: string[], targetWords: number): number {
+  const target = Math.max(1, Math.min(words.length - 1, targetWords));
+  const min = Math.max(1, Math.floor(target * 0.65));
+  const max = Math.min(words.length - 1, Math.ceil(target * 1.2));
+
+  for (let i = target; i >= min; i--) {
+    if (/[.!?;:,\u2014-]$/.test(words[i - 1] ?? "")) return i;
+  }
+  for (let i = target; i <= max; i++) {
+    if (/[.!?;:,\u2014-]$/.test(words[i - 1] ?? "")) return i;
+  }
+  for (let i = target; i >= min; i--) {
+    const next = (words[i] ?? "").toLowerCase().replace(/[^a-z]+/gi, "");
+    if (new Set(["and", "but", "while", "because", "as", "with"]).has(next)) return i;
+  }
+  return target;
+}
+
+function estimateStockTailSeconds(words: number): number {
+  return Math.max(4, Math.ceil(words / (WORDS_PER_MINUTE / 60)));
+}
+
+function wordCount(text: string): number {
+  return text.trim().split(/\s+/).filter(Boolean).length;
+}
+
+function compact(text: string): string {
+  return text.trim().replace(/\s+/g, " ");
 }
 
 /**
@@ -230,175 +517,11 @@ async function processChunk(
   });
 }
 
-/**
- * Splits a script into chunks at sentence boundaries, targeting `targetWords`
- * per chunk. A "sentence" is anything up to a `.`, `!` or `?`.
- *
- * If the script has no sentence terminators we return it whole — bad chunking
- * is worse than no chunking, and the only way to get here is a script written
- * without punctuation, which won't scene-split well anyway.
- */
-function chunkScript(script: string, targetWords: number): string[] {
-  const sentenceRegex = /[^.!?]+[.!?]+["')\]]*\s*/g;
-  const matches = script.match(sentenceRegex);
-  if (!matches || matches.length === 0) return [script];
-
-  // If the regex didn't consume the trailing characters (e.g. a final
-  // sentence without a terminator), append the leftover so we cover 100%
-  // of the script.
-  const sentences: string[] = [...matches];
-  const captured = matches.join("");
-  if (captured.length < script.length) {
-    sentences.push(script.slice(captured.length));
-  }
-
-  const chunks: string[] = [];
-  let current = "";
-  let currentWords = 0;
-  for (const sent of sentences) {
-    const sentWords = sent.trim().split(/\s+/).filter(Boolean).length;
-    if (currentWords > 0 && currentWords + sentWords > targetWords) {
-      chunks.push(current.trim());
-      current = "";
-      currentWords = 0;
-    }
-    current += sent;
-    currentWords += sentWords;
-  }
-  if (current.trim().length > 0) chunks.push(current.trim());
-  return chunks;
-}
-
-/**
- * Scene-length normalization (pacing rewrite — Prompt 6).
- *
- * Target is 6–8s scenes cut by idea. The LLM does most of this, but we enforce
- * the hard bounds in code so output is predictable no matter what the model did.
- * Splitting/merging only ever moves whole words, so the joined text stays
- * byte-identical and script coverage remains 100%.
- *
- *  - Over-long scenes (> MAX_SCENE_WORDS, ~8s) are split into the fewest pieces
- *    that all fit, preferring a clause boundary (em-dash, semicolon, colon,
- *    comma) near each cut and falling back to an even word split.
- *  - Under-length scenes (< MIN_SCENE_WORDS, ~4s) are merged with a neighbor —
- *    forward (into the next scene) first, then backward — so a stray fragment
- *    is never its own scene. A merge is skipped only if it would exceed the max.
- *
- * Word↔second mapping assumes the calm narration pace (~150 raw wpm × 0.85).
- */
-// Pacing bounds (Prompt 9 — faster chunking + hook acceleration).
-// Body: 4–6s scenes (~10–14 words); the first ~150 words (the hook) go faster
-// at 3–5s (~8–12 words). Bounds are chosen by each scene's cumulative position.
-const MAX_WORDS = 15; // ~6s body hard max
-const MIN_WORDS = 8; // ~3.2s body minimum
-const HOOK_MAX_WORDS = 12; // ~4.8s hook max
-const HOOK_MIN_WORDS = 6; // ~2.4s hook minimum
-const HOOK_WORD_WINDOW = 150; // first ~150 words use the hook bounds
-const CLAUSE_END = /[—;:,]$/; // a word that ends a clause
-
-const wordCount = (t: string) => t.trim().split(/\s+/).filter(Boolean).length;
-const hintSec = (words: number) => Math.min(8, Math.max(3, Math.round((words / 150) * 60)));
-const boundsAt = (cumWords: number) =>
-  cumWords < HOOK_WORD_WINDOW
-    ? { max: HOOK_MAX_WORDS, min: HOOK_MIN_WORDS }
-    : { max: MAX_WORDS, min: MIN_WORDS };
-
-/** Split one over-long scene into ≤maxWords pieces, preferring clause cuts. */
-function splitLongScene(s: Scene, maxWords: number): Scene[] {
-  const words = s.text.trim().split(/\s+/).filter(Boolean);
-  if (words.length <= maxWords) return [s];
-
-  const pieceCount = Math.ceil(words.length / maxWords);
-  const targetLen = Math.ceil(words.length / pieceCount);
-  const pieces: string[][] = [];
-  let start = 0;
-
-  for (let p = 0; p < pieceCount - 1; p++) {
-    const ideal = start + targetLen;
-    let cut = ideal;
-    // Look for a clause boundary within ±4 words of the ideal cut; nearest wins.
-    let best = -1;
-    const lo = Math.max(start + 1, ideal - 4);
-    const hi = Math.min(words.length - 1, ideal + 4);
-    for (let i = lo; i <= hi; i++) {
-      if (CLAUSE_END.test(words[i - 1]) && (best === -1 || Math.abs(i - ideal) < Math.abs(best - ideal))) {
-        best = i;
-      }
-    }
-    if (best !== -1) cut = best;
-    // Leave at least one word for each remaining piece.
-    cut = Math.max(start + 1, Math.min(cut, words.length - (pieceCount - 1 - p)));
-    pieces.push(words.slice(start, cut));
-    start = cut;
-  }
-  pieces.push(words.slice(start));
-
-  // The pieces describe the SAME beat as the parent — only the first piece may
-  // legitimately break continuity (inheriting the parent's flag); subsequent
-  // pieces explicitly do NOT break (they're a forced sub-split of one shot).
-  return pieces.map((w, i) => ({
-    index: 0,
-    text: w.join(" "),
-    visual_prompt: s.visual_prompt,
-    duration_hint_sec: hintSec(w.length),
-    continuity_group_id: s.continuity_group_id ?? null,
-    continuity_break: i === 0 ? !!s.continuity_break : false,
-    continuity_hint: s.continuity_hint ?? null,
-  }));
-}
-
-function enforceMaxSceneLength(scenes: Scene[]): Scene[] {
-  // Pass 1 — split over-long scenes. Bounds depend on cumulative word position
-  // (the hook window gets a tighter max for snappier pacing).
-  const split: Scene[] = [];
-  let cumSplit = 0;
-  for (const s of scenes) {
-    const { max } = boundsAt(cumSplit);
-    split.push(...splitLongScene(s, max));
-    cumSplit += wordCount(s.text);
-  }
-
-  // Pass 2 — merge under-length scenes (forward first, then backward).
-  const merged: Scene[] = [];
-  let i = 0;
-  let cumMerge = 0;
-  while (i < split.length) {
-    const { min, max } = boundsAt(cumMerge);
-    let cur: Scene = { ...split[i] };
-    let curWords = wordCount(cur.text);
-
-    // Merge forward while still too short and the next scene fits.
-    while (curWords < min && i + 1 < split.length) {
-      const nextWords = wordCount(split[i + 1].text);
-      if (curWords + nextWords > max) break;
-      cur = { ...cur, text: `${cur.text} ${split[i + 1].text}`.trim() };
-      curWords += nextWords;
-      i++;
-    }
-
-    // Still short and nothing to merge forward → fold backward into previous.
-    if (curWords < min && merged.length > 0) {
-      const prev = merged[merged.length - 1];
-      const prevWords = wordCount(prev.text);
-      if (prevWords + curWords <= max) {
-        prev.text = `${prev.text} ${cur.text}`.trim();
-        prev.duration_hint_sec = hintSec(prevWords + curWords);
-        cumMerge += curWords;
-        i++;
-        continue;
-      }
-    }
-
-    cur.duration_hint_sec = hintSec(curWords);
-    merged.push(cur);
-    cumMerge += curWords;
-    i++;
-  }
-
-  return merged.map((s, i) => ({ ...s, index: i }));
-}
-
-async function splitWithGemini(systemPrompt: string, script: string): Promise<string> {
+async function splitWithGemini(
+  systemPrompt: string,
+  script: string,
+  opts?: { thinkingBudget?: number }
+): Promise<string> {
   const apiKey = getSetting("GOOGLE_API_KEY");
   if (!apiKey) throw new Error("GOOGLE_API_KEY is not set (Settings)");
   const model = getSetting("SCENE_SPLIT_MODEL") || "gemini-flash-latest";
@@ -416,7 +539,7 @@ async function splitWithGemini(systemPrompt: string, script: string): Promise<st
       // with a clear "lower WORDS_PER_CHUNK" message.
       maxOutputTokens: 65535,
       // Disable thinking — for structured output it just wastes the token budget
-      thinkingConfig: { thinkingBudget: 0 },
+      thinkingConfig: { thinkingBudget: opts?.thinkingBudget ?? 0 },
     },
   });
 
@@ -428,38 +551,50 @@ async function splitWithGemini(systemPrompt: string, script: string): Promise<st
   let lastErr = "";
 
   while (attempt <= MAX_RETRIES) {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-    });
-    if (resp.ok) {
-      const json = (await resp.json()) as {
-        candidates?: {
-          content?: { parts?: { text?: string }[] };
-          finishReason?: string;
-        }[];
-        usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number };
-      };
-      const cand = json.candidates?.[0];
-      const text = cand?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
-      const reason = cand?.finishReason;
-      if (reason && reason !== "STOP") {
+    try {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+      if (resp.ok) {
+        const json = (await resp.json()) as {
+          candidates?: {
+            content?: { parts?: { text?: string }[] };
+            finishReason?: string;
+          }[];
+          usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number };
+        };
+        const cand = json.candidates?.[0];
+        const text = cand?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+        const reason = cand?.finishReason;
+        if (reason && reason !== "STOP") {
+          throw new Error(
+            `Gemini finish=${reason} (output cut off, tokens=${json.usageMetadata?.candidatesTokenCount}). ` +
+              `Even a single ~3 000-word chunk produced more than Gemini's 65 535-token output cap — ` +
+              `lower WORDS_PER_CHUNK in scene-split.ts, or shorten this chunk's visual_prompt instructions.`
+          );
+        }
+        if (!text) throw new Error(`Gemini: empty output (${JSON.stringify(json).slice(0, 300)})`);
+        return text;
+      }
+      const errText = (await resp.text()).slice(0, 400);
+      lastErr = `Gemini ${resp.status}: ${errText}`;
+      if (!RETRYABLE.has(resp.status) || attempt === MAX_RETRIES) {
+        throw new Error(lastErr);
+      }
+    } catch (e) {
+      if (e instanceof Error && e.message.startsWith("Gemini finish=")) throw e;
+      if (e instanceof Error && e.message.startsWith("Gemini: empty")) throw e;
+      if (e instanceof Error && e.message.match(/^Gemini [45]\d{2}:/)) throw e;
+      lastErr = e instanceof Error ? e.message : String(e);
+      if (attempt === MAX_RETRIES) {
         throw new Error(
-          `Gemini finish=${reason} (output cut off, tokens=${json.usageMetadata?.candidatesTokenCount}). ` +
-            `Even a single ~3 000-word chunk produced more than Gemini's 65 535-token output cap — ` +
-            `lower WORDS_PER_CHUNK in scene-split.ts, or shorten this chunk's visual_prompt instructions.`
+          `Gemini request failed after ${MAX_RETRIES + 1} attempts (${lastErr}). Check your network and GOOGLE_API_KEY, then start a new run.`
         );
       }
-      if (!text) throw new Error(`Gemini: empty output (${JSON.stringify(json).slice(0, 300)})`);
-      return text;
     }
-    const errText = (await resp.text()).slice(0, 400);
-    lastErr = `Gemini ${resp.status}: ${errText}`;
-    if (!RETRYABLE.has(resp.status) || attempt === MAX_RETRIES) {
-      throw new Error(lastErr);
-    }
-    // 1s, 2s, 4s, 8s
+    // 1s, 2s, 4s, 8s — transient network blips + 429/503
     const waitMs = 1000 * Math.pow(2, attempt);
     await new Promise((r) => setTimeout(r, waitMs));
     attempt++;

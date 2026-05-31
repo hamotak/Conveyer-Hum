@@ -48,6 +48,7 @@ export function ThemeToggle() {
         alignItems: "center",
         gap: 8,
         width: "100%",
+        minHeight: 36,
         padding: "7px 10px",
         borderRadius: 8,
         background: "transparent",

@@ -6,9 +6,10 @@ import { getSetting } from "../settings";
 import { log } from "../logger";
 import type { Scene } from "./scene-split";
 import { createTtsJob, pollJob, downloadJob, cancelJob, releaseJob } from "./labs69";
-import { probeDurationSafe } from "./video-assemble";
-import { CancelledError, isCancelled, registerJob, unregisterJob } from "../cancellation";
+import { probeDurationSafe, concatAudioFiles } from "./video-assemble";
+import { CancelledError, checkCancelled, isCancelled, registerJob, unregisterJob } from "../cancellation";
 import { pickVoiceId } from "../voice-resolve";
+import { chunkTextByNarrationUnits } from "../text-chunking";
 
 export interface TtsResult {
   /** Path to the mp3 file. */
@@ -70,6 +71,7 @@ export async function synthesizeScene(
   const fileName = `scene_${String(scene.index).padStart(3, "0")}.mp3`;
   const filePath = path.join(outDir, fileName);
   log(runId, "info", `TTS scene #${scene.index}`, { stage: "tts", data: { text: scene.text.slice(0, 80) } });
+  checkCancelled(runId);
   await dispatchTts(runId, scene.text, filePath, options);
   const durationSec = await probeDurationSafe(filePath);
   log(runId, "success", `TTS done: ${fileName} (${durationSec.toFixed(1)}s)`, { stage: "tts" });
@@ -87,11 +89,84 @@ export async function synthesizeFullScript(
   outPath: string,
   options: TtsOptions = {}
 ): Promise<TtsResult> {
+  if (fileReady(outPath)) {
+    const durationSec = await probeDurationSafe(outPath);
+    log(runId, "info", `Voiceover already exists: ${path.basename(outPath)} (${durationSec.toFixed(1)}s)`, { stage: "tts" });
+    return { filePath: outPath, durationSec };
+  }
   const provider = (getSetting("TTS_PROVIDER") || "minimax").toLowerCase();
   log(runId, "info", `TTS full script (${provider}, ${text.length} chars)`, { stage: "tts" });
+  checkCancelled(runId);
   await dispatchTts(runId, text, outPath, options);
   const durationSec = await probeDurationSafe(outPath);
   log(runId, "success", `Voiceover done: ${path.basename(outPath)} (${durationSec.toFixed(1)}s)`, { stage: "tts" });
+  return { filePath: outPath, durationSec };
+}
+
+function fileReady(filePath: string): boolean {
+  try {
+    return fs.statSync(filePath).size > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Continuous voiceover for the hybrid TAIL: one consistent voice over the whole
+ * tail, NO per-scene editing. Long text is split at sentence boundaries into
+ * chunks (default ≤ 9000 chars — comfortably under provider limits), each
+ * synthesized separately and concatenated, so a 1–2 hour tail still works in a
+ * single logical voiceover. Short tails are a single call.
+ */
+export async function synthesizeContinuous(
+  runId: string,
+  text: string,
+  outPath: string,
+  options: TtsOptions = {},
+  maxChars = 9000
+): Promise<TtsResult> {
+  if (fileReady(outPath)) {
+    const durationSec = await probeDurationSafe(outPath);
+    log(runId, "info", `Continuous voiceover already exists: ${path.basename(outPath)} (${(durationSec / 60).toFixed(1)} min)`, {
+      stage: "tts",
+    });
+    return { filePath: outPath, durationSec };
+  }
+
+  const clean = text.trim();
+  if (clean.length <= maxChars) {
+    return synthesizeFullScript(runId, clean, outPath, options);
+  }
+
+  const chunks = chunkTextByNarrationUnits(clean, { maxChars });
+
+  log(runId, "info", `Continuous tail voiceover: ${clean.length} chars → ${chunks.length} chunks`, {
+    stage: "tts",
+  });
+
+  const partPaths: string[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const partPath = outPath.replace(/\.mp3$/i, `_part${String(i).padStart(3, "0")}.mp3`);
+    if (fileReady(partPath)) {
+      partPaths.push(partPath);
+      log(runId, "info", `Tail voiceover chunk ${i + 1}/${chunks.length} already exists`, { stage: "tts" });
+      continue;
+    }
+    checkCancelled(runId);
+    await dispatchTts(runId, chunks[i], partPath, options);
+    partPaths.push(partPath);
+    log(runId, "info", `Tail voiceover chunk ${i + 1}/${chunks.length} done`, { stage: "tts" });
+  }
+
+  checkCancelled(runId);
+  await concatAudioFiles(partPaths, outPath);
+  for (const p of partPaths) {
+    try { fs.rmSync(p, { force: true }); } catch {}
+  }
+  const durationSec = await probeDurationSafe(outPath);
+  log(runId, "success", `Tail voiceover done: ${path.basename(outPath)} (${(durationSec / 60).toFixed(1)} min)`, {
+    stage: "tts",
+  });
   return { filePath: outPath, durationSec };
 }
 
@@ -270,7 +345,7 @@ async function labs69Tts(runId: string, text: string, outPath: string, options: 
       ? (voiceProviderRaw as "elevenlabs" | "edgetts" | "voice-clone")
       : "edgetts";
   const modelId = getSetting("TTS_MODEL") || undefined;
-  const splitTypeRaw = (getSetting("TTS_SPLIT_TYPE") || "smart").toLowerCase();
+  const splitTypeRaw = (getSetting("TTS_SPLIT_TYPE") || "paragraphs").toLowerCase();
   const splitType =
     splitTypeRaw === "paragraphs" || splitTypeRaw === "max_length"
       ? (splitTypeRaw as "smart" | "paragraphs" | "max_length")

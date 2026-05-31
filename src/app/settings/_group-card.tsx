@@ -11,12 +11,13 @@ interface GroupCardProps {
 /** Renders one settings group as a single card with all its fields. */
 export function GroupCard({ group, values, setValues }: GroupCardProps) {
   const [open, setOpen] = useState(!group.collapsed);
+  const groupMissing = group.fields.some((f) => f.required && !values[f.key]);
   return (
     <div
       className="card"
       style={{
         marginBottom: 14,
-        borderColor: group.required ? "rgba(248,113,113,0.4)" : undefined,
+        borderColor: groupMissing ? "rgba(248,113,113,0.4)" : undefined,
       }}
     >
       {group.collapsed ? (
@@ -27,10 +28,11 @@ export function GroupCard({ group, values, setValues }: GroupCardProps) {
             display: "flex",
             alignItems: "center",
             gap: 8,
+            minHeight: 36,
             marginBottom: open ? 4 : 0,
             background: "none",
             border: "none",
-            padding: 0,
+            padding: "7px 0",
             cursor: "pointer",
             width: "100%",
             textAlign: "left",
@@ -44,8 +46,14 @@ export function GroupCard({ group, values, setValues }: GroupCardProps) {
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
           <h2 style={{ margin: 0 }}>{group.title}</h2>
           {group.required && (
-            <span className="badge" style={{ background: "var(--danger-soft)", color: "var(--danger)" }}>
-              REQUIRED
+            <span
+              className="badge"
+              style={{
+                background: groupMissing ? "var(--danger-soft)" : "var(--success-soft, rgba(74,222,128,0.1))",
+                color: groupMissing ? "var(--danger)" : "var(--success)",
+              }}
+            >
+              {groupMissing ? "NEEDS SETUP" : "READY"}
             </span>
           )}
         </div>
@@ -60,14 +68,16 @@ export function GroupCard({ group, values, setValues }: GroupCardProps) {
           <div style={{ display: "grid", gap: 16 }}>
         {group.fields.map((f) => {
           const missing = f.required && !values[f.key];
+          const inputId = `setting-${f.key}`;
           return (
             <div key={f.key}>
               <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 5 }}>
                 <label
+                  htmlFor={inputId}
                   className="label"
                   style={{
                     margin: 0,
-                    color: f.required ? "var(--danger)" : "var(--fg)",
+                    color: missing ? "var(--danger)" : "var(--fg)",
                     fontWeight: 600,
                     letterSpacing: "0.01em",
                   }}
@@ -75,13 +85,20 @@ export function GroupCard({ group, values, setValues }: GroupCardProps) {
                   {f.label ?? f.key}
                 </label>
                 {f.required && (
-                  <span style={{ color: "var(--danger)", fontSize: 10.5, fontWeight: 700 }}>
-                    required
+                  <span
+                    style={{
+                      color: missing ? "var(--danger)" : "var(--success)",
+                      fontSize: 10.5,
+                      fontWeight: 700,
+                    }}
+                  >
+                    {missing ? "required" : "set"}
                   </span>
                 )}
               </div>
               {f.options ? (
                 <select
+                  id={inputId}
                   className="input"
                   value={values[f.key] ?? ""}
                   onChange={(e) => setValues({ ...values, [f.key]: e.target.value })}
@@ -99,6 +116,7 @@ export function GroupCard({ group, values, setValues }: GroupCardProps) {
                 </select>
               ) : f.multiline ? (
                 <textarea
+                  id={inputId}
                   className="textarea"
                   value={values[f.key] ?? ""}
                   placeholder={f.examples ? `e.g. ${f.examples}` : ""}
@@ -108,6 +126,7 @@ export function GroupCard({ group, values, setValues }: GroupCardProps) {
                 />
               ) : (
                 <input
+                  id={inputId}
                   className="input"
                   value={values[f.key] ?? ""}
                   placeholder={f.examples ? `e.g. ${f.examples}` : ""}
@@ -116,7 +135,7 @@ export function GroupCard({ group, values, setValues }: GroupCardProps) {
                 />
               )}
               {f.key === "LABS69_API_KEY" && values[f.key] && (
-                <div style={{ color: "var(--accent-hover)", fontSize: 12, marginTop: 6 }}>
+                <div style={{ color: "var(--success)", fontSize: 12, marginTop: 6 }}>
                   Detected{" "}
                   <strong>
                     {values[f.key].split(/[\n,;]+/).map((k) => k.trim()).filter(Boolean).length}

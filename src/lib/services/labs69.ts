@@ -1,6 +1,14 @@
 import fs from "node:fs";
+import { CancelledError, checkCancelled } from "../cancellation";
 import { getSetting } from "../settings";
 import { log, type LogLevel } from "../logger";
+import {
+  isProviderCapacityResponse,
+  pollIntervalMs,
+  pollTimeoutMs,
+  positiveInt,
+  retryWaitMs,
+} from "./labs69-capacity";
 
 /**
  * 69labs.vip API client with multi-key pool support.
@@ -20,13 +28,38 @@ import { log, type LogLevel } from "../logger";
  */
 
 const BASE = "https://69labs.vip/api/v1";
-const POLL_INTERVAL_MS = 2500;
-// nano-banana-pro 2K can legitimately take 4–5 min. 8 min is enough headroom
-// without keeping zombie polls alive forever.
-const POLL_MAX_MS = 8 * 60 * 1000;
+const CAPABILITY_CACHE_MS = 60_000;
 
 export type JobKind = "tts" | "images" | "videos";
 type JobStatus = "PENDING" | "PROCESSING" | "FINALIZING" | "COMPLETED" | "FAILED" | "CANCELLED" | "CENSORED";
+export interface Labs69RuntimeLimits {
+  source: "live" | "settings";
+  keyCount: number;
+  imagePerKey: number;
+  videoPerKey: number;
+  ttsPerKey: number;
+  imageRemainingMonthly?: number;
+  videoRemainingMonthly?: number;
+  imageModels: string[];
+  videoModels: string[];
+}
+
+interface ModelsSection {
+  limits?: { maxConcurrentJobs?: unknown };
+  usage?: Record<string, unknown>;
+  models?: unknown[];
+  monthlyRemaining?: unknown;
+  monthlyUsageRemaining?: unknown;
+  remainingMonthly?: unknown;
+}
+
+let capabilityCache:
+  | {
+      fingerprint: string;
+      expiresAt: number;
+      value: Labs69RuntimeLimits;
+    }
+  | null = null;
 
 // ── Key pool ────────────────────────────────────────────────────────────────
 
@@ -37,17 +70,40 @@ type JobStatus = "PENDING" | "PROCESSING" | "FINALIZING" | "COMPLETED" | "FAILED
  */
 const pool = {
   active: new Map<string, number>(),
+  healthyFingerprint: "",
+  healthyKeys: null as string[] | null,
 
   list(): string[] {
-    return getSetting("LABS69_API_KEY")
+    return [...new Set(getSetting("LABS69_API_KEY")
       .split(/[\n,;]+/)
       .map((k) => k.trim())
-      .filter(Boolean);
+      .filter(Boolean))];
+  },
+
+  fingerprint(keys: string[]): string {
+    return keys.map((k) => `${k.length}:${k.slice(0, 4)}:${k.slice(-4)}`).join("|");
+  },
+
+  usableList(): string[] {
+    const keys = this.list();
+    if (
+      this.healthyKeys &&
+      this.healthyKeys.length > 0 &&
+      this.healthyFingerprint === this.fingerprint(keys)
+    ) {
+      return this.healthyKeys;
+    }
+    return keys;
+  },
+
+  setHealthy(keys: string[] | null, fingerprint: string) {
+    this.healthyFingerprint = fingerprint;
+    this.healthyKeys = keys && keys.length > 0 ? [...new Set(keys)] : null;
   },
 
   /** Pick the least-loaded key from the current pool. Bumps its counter. */
   pick(): string {
-    const keys = this.list();
+    const keys = this.usableList();
     if (keys.length === 0) throw new Error("LABS69_API_KEY is not set (Settings)");
     let best = keys[0];
     let bestCount = this.active.get(best) ?? 0;
@@ -79,6 +135,40 @@ export function getKeyCount(): number {
   return pool.list().length;
 }
 
+export async function discoverLabs69Runtime(): Promise<Labs69RuntimeLimits> {
+  const keys = pool.list();
+  const fallback = fallbackRuntime(keys.length);
+  if (keys.length === 0) return fallback;
+
+  const fingerprint = pool.fingerprint(keys);
+  if (capabilityCache && capabilityCache.fingerprint === fingerprint && capabilityCache.expiresAt > Date.now()) {
+    return capabilityCache.value;
+  }
+
+  const rows = await Promise.all(
+    keys.map(async (key) => {
+      try {
+        const r = await fetch(`${BASE}/models`, { headers: { Authorization: `Bearer ${key}` } });
+        if (!r.ok) return null;
+        const json = (await r.json()) as Record<string, unknown>;
+        return { key, parsed: parseModelsResponse(json) };
+      } catch {
+        return null;
+      }
+    })
+  );
+
+  const liveRows = rows.filter((r): r is { key: string; parsed: ParsedModelsResponse } => r !== null);
+  pool.setHealthy(liveRows.map((r) => r.key), fingerprint);
+  const live = liveRows.map((r) => r.parsed);
+  const value =
+    live.length > 0
+      ? mergeRuntime(live.length, live, fallbackRuntime(live.length))
+      : fallback;
+  capabilityCache = { fingerprint, expiresAt: Date.now() + CAPABILITY_CACHE_MS, value };
+  return value;
+}
+
 // ── Job ↔ key binding ───────────────────────────────────────────────────────
 
 /**
@@ -108,7 +198,7 @@ function keyFor(jobId: string): string {
   const k = jobKeyMap.get(jobId);
   if (k) return k;
   // Fallback to first key — happens for older jobs without binding (e.g. after server restart).
-  const keys = pool.list();
+  const keys = pool.usableList();
   if (keys.length === 0) throw new Error("LABS69_API_KEY is not set");
   return keys[0];
 }
@@ -126,9 +216,10 @@ async function postJsonWithKey<T>(
   key: string,
   ctx?: { runId: string; stage: string }
 ): Promise<T> {
-  const MAX_RATE_RETRIES = 40;
-  let rateRetry = 0;
+  const MAX_PROVIDER_RETRIES = 180;
+  let retry = 0;
   while (true) {
+    if (ctx) checkCancelled(ctx.runId);
     const r = await fetch(`${BASE}${path}`, {
       method: "POST",
       headers: authHeadersFor(key),
@@ -136,25 +227,30 @@ async function postJsonWithKey<T>(
     });
     if (r.ok) return (await r.json()) as T;
 
-    if (r.status === 429 && rateRetry < MAX_RATE_RETRIES) {
-      rateRetry++;
-      const retryAfter = Number(r.headers.get("retry-after"));
-      const waitMs =
-        Number.isFinite(retryAfter) && retryAfter > 0
-          ? Math.min(retryAfter * 1000, 10 * 60_000)
-          : Math.min(10 * 60_000, 20_000 * rateRetry); // 20s, 40s, … capped at 10min
+    const text = await r.text();
+    const capacity = isProviderCapacityResponse(r.status, text);
+    const rateLimited = r.status === 429;
+    if ((capacity || rateLimited) && retry < MAX_PROVIDER_RETRIES) {
+      retry++;
+      const waitMs = retryWaitMs(r.headers.get("retry-after"), retry, {
+        baseMs: capacity ? 10_000 : 20_000,
+        maxMs: capacity ? 2 * 60_000 : 10 * 60_000,
+      });
       if (ctx) {
+        const label = providerLabel(path);
         log(
           ctx.runId,
           "warn",
-          `69labs rate limit (429) — waiting ${Math.round(waitMs / 1000)}s then retrying (${rateRetry}/${MAX_RATE_RETRIES})`,
+          capacity
+            ? `Provider full - waiting ${Math.round(waitMs / 1000)}s for a ${label} slot (${retry}/${MAX_PROVIDER_RETRIES})`
+            : `69labs rate limit (429) - waiting ${Math.round(waitMs / 1000)}s then retrying (${retry}/${MAX_PROVIDER_RETRIES})`,
           { stage: ctx.stage }
         );
       }
-      await sleep(waitMs);
+      await sleep(waitMs, ctx?.runId);
       continue;
     }
-    throw new Error(`69labs POST ${path} ${r.status}: ${(await r.text()).slice(0, 400)}`);
+    throw new Error(`69labs POST ${path} ${r.status}: ${text.slice(0, 400)}`);
   }
 }
 
@@ -415,17 +511,26 @@ export async function pollJob(
   jobId: string,
   runId: string,
   stage: string,
-  level: LogLevel = "debug"
+  level: LogLevel = "debug",
+  opts: { model?: string | null; timeoutMs?: number; intervalMs?: number } = {}
 ): Promise<void> {
   const key = keyFor(jobId);
   const start = Date.now();
+  const timeoutMs = opts.timeoutMs ?? pollTimeoutMs(kind, opts.model);
+  const intervalMs = opts.intervalMs ?? pollIntervalMs(kind);
   while (true) {
+    checkCancelled(runId);
     const r = await fetch(`${BASE}/${kind}/status/${jobId}`, { headers: authHeadersFor(key) });
+    checkCancelled(runId);
     if (!r.ok) {
       // A 429 on the status endpoint is transient — back off and keep polling
       // rather than failing the job.
       if (r.status === 429) {
-        await sleep(POLL_INTERVAL_MS * 4);
+        const waitMs = retryWaitMs(r.headers.get("retry-after"), 1, {
+          baseMs: intervalMs * 4,
+          maxMs: 60_000,
+        });
+        await sleep(waitMs, runId);
         continue;
       }
       throw new Error(`69labs status ${kind}/${jobId} ${r.status}: ${(await r.text()).slice(0, 200)}`);
@@ -457,10 +562,10 @@ export async function pollJob(
         `69labs ${kind} job ${jobId} ${json.status}${parts.length ? `: ${parts.join(" | ")}` : ""}`
       );
     }
-    if (Date.now() - start > POLL_MAX_MS) {
-      throw new Error(`69labs ${kind} job ${jobId} exceeded ${POLL_MAX_MS / 1000}s polling timeout`);
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`69labs ${kind} job ${jobId} exceeded ${Math.round(timeoutMs / 60_000)}m polling timeout`);
     }
-    await sleep(POLL_INTERVAL_MS);
+    await sleep(intervalMs, runId);
   }
 }
 
@@ -509,6 +614,120 @@ export async function downloadJob(
   }
 }
 
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
+async function sleep(ms: number, runId?: string) {
+  const stepMs = runId ? 1000 : ms;
+  let remaining = ms;
+  while (remaining > 0) {
+    if (runId) {
+      try {
+        checkCancelled(runId);
+      } catch (e) {
+        throw e instanceof CancelledError ? e : new CancelledError(`Run ${runId} cancelled`);
+      }
+    }
+    await new Promise((r) => setTimeout(r, Math.min(stepMs, remaining)));
+    remaining -= stepMs;
+  }
+  if (runId) checkCancelled(runId);
+}
+
+function fallbackRuntime(keyCount: number): Labs69RuntimeLimits {
+  return {
+    source: "settings",
+    keyCount,
+    imagePerKey: positiveInt(getSetting("IMAGE_CONCURRENCY")) ?? 7,
+    videoPerKey: positiveInt(getSetting("ANIMATION_CONCURRENCY")) ?? 5,
+    ttsPerKey: positiveInt(getSetting("TTS_CONCURRENCY")) ?? 3,
+    imageModels: [],
+    videoModels: [],
+  };
+}
+
+interface ParsedModelsResponse {
+  imageSlots?: number;
+  videoSlots?: number;
+  ttsSlots?: number;
+  imageRemainingMonthly?: number;
+  videoRemainingMonthly?: number;
+  imageModels: string[];
+  videoModels: string[];
+}
+
+function parseModelsResponse(json: Record<string, unknown>): ParsedModelsResponse {
+  const images = readSection(json.images);
+  const videos = readSection(json.videos);
+  const tts = readSection(json.tts);
+  return {
+    imageSlots: positiveInt(images?.limits?.maxConcurrentJobs) ?? undefined,
+    videoSlots: positiveInt(videos?.limits?.maxConcurrentJobs) ?? undefined,
+    ttsSlots: positiveInt(tts?.limits?.maxConcurrentJobs) ?? undefined,
+    imageRemainingMonthly: readMonthlyRemaining(images),
+    videoRemainingMonthly: readMonthlyRemaining(videos),
+    imageModels: readModelIds(images),
+    videoModels: readModelIds(videos),
+  };
+}
+
+function mergeRuntime(
+  keyCount: number,
+  live: ParsedModelsResponse[],
+  fallback: Labs69RuntimeLimits
+): Labs69RuntimeLimits {
+  const imageSlots = live.map((r) => r.imageSlots ?? fallback.imagePerKey);
+  const videoSlots = live.map((r) => r.videoSlots ?? fallback.videoPerKey);
+  const ttsSlots = live.map((r) => r.ttsSlots ?? fallback.ttsPerKey);
+  return {
+    source: "live",
+    keyCount,
+    imagePerKey: Math.max(1, Math.min(...imageSlots)),
+    videoPerKey: Math.max(1, Math.min(...videoSlots)),
+    ttsPerKey: Math.max(1, Math.min(...ttsSlots)),
+    imageRemainingMonthly: sumKnown(live.map((r) => r.imageRemainingMonthly)),
+    videoRemainingMonthly: sumKnown(live.map((r) => r.videoRemainingMonthly)),
+    imageModels: [...new Set(live.flatMap((r) => r.imageModels))],
+    videoModels: [...new Set(live.flatMap((r) => r.videoModels))],
+  };
+}
+
+function readSection(value: unknown): ModelsSection | undefined {
+  return value && typeof value === "object" ? (value as ModelsSection) : undefined;
+}
+
+function readMonthlyRemaining(section: ModelsSection | undefined): number | undefined {
+  const usage = section?.usage;
+  const monthly = usage?.monthly && typeof usage.monthly === "object" ? (usage.monthly as Record<string, unknown>) : undefined;
+  return (
+    positiveInt(section?.monthlyRemaining) ??
+    positiveInt(section?.monthlyUsageRemaining) ??
+    positiveInt(section?.remainingMonthly) ??
+    positiveInt(usage?.monthlyRemaining) ??
+    positiveInt(usage?.remainingMonthly) ??
+    positiveInt(monthly?.remaining) ??
+    undefined
+  );
+}
+
+function readModelIds(section: ModelsSection | undefined): string[] {
+  if (!Array.isArray(section?.models)) return [];
+  return section.models
+    .map((m) => {
+      if (typeof m === "string") return m;
+      if (!m || typeof m !== "object") return null;
+      const row = m as Record<string, unknown>;
+      const id = row.id ?? row.modelId ?? row.model ?? row.name;
+      return typeof id === "string" && id.trim() ? id.trim() : null;
+    })
+    .filter((id): id is string => Boolean(id));
+}
+
+function sumKnown(values: Array<number | undefined>): number | undefined {
+  const known = values.filter((v): v is number => typeof v === "number");
+  return known.length > 0 ? known.reduce((a, b) => a + b, 0) : undefined;
+}
+
+function providerLabel(path: string): string {
+  if (path.startsWith("/videos")) return "video";
+  if (path.startsWith("/images")) return "image";
+  if (path.startsWith("/tts") || path.startsWith("/voice-clones")) return "voice";
+  return "provider";
 }

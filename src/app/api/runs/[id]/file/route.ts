@@ -1,10 +1,11 @@
 import { NextResponse } from "next/server";
-import path from "node:path";
 import fs from "node:fs";
+import path from "node:path";
 import db from "@/lib/db";
 import { ensureInit } from "@/lib/init";
 import { getRunDir } from "@/lib/run-paths";
 import { ensureVideoPoster } from "@/lib/services/video-poster";
+import { readRunExportState } from "@/lib/run-export-state";
 
 /** Stream a file (or a byte range of it) as a Web ReadableStream — never buffers
  *  the whole thing in memory, so 1 GB+ final.mp4 plays back fine. */
@@ -56,7 +57,7 @@ function streamFile(target: string, start?: number, end?: number): ReadableStrea
   });
 }
 
-const getRun = db.prepare("SELECT id FROM runs WHERE id = ?");
+const getRun = db.prepare("SELECT id, status FROM runs WHERE id = ?");
 
 /**
  * Serves any file from a run folder.
@@ -70,16 +71,31 @@ const getRun = db.prepare("SELECT id FROM runs WHERE id = ?");
 export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }) {
   ensureInit();
   const { id } = await ctx.params;
-  if (!getRun.get(id)) return NextResponse.json({ error: "run not found" }, { status: 404 });
+  const run = getRun.get(id) as { id: string; status: string } | undefined;
+  if (!run) return NextResponse.json({ error: "run not found" }, { status: 404 });
 
   const url = new URL(req.url);
-  const rel = url.searchParams.get("p") ?? "final.mp4";
+  const rel = normalizeRequestedPath(url.searchParams.get("p") ?? "final.mp4");
+  if (!rel) return NextResponse.json({ error: "path escape blocked" }, { status: 400 });
   const download = url.searchParams.get("download") === "1";
 
   const runDir = path.resolve(getRunDir(id));
-  let target = path.resolve(path.join(runDir, rel));
+  let target = path.resolve(runDir, rel);
   if (!target.startsWith(runDir + path.sep) && target !== runDir) {
     return NextResponse.json({ error: "path escape blocked" }, { status: 400 });
+  }
+  if (rel === "final.mp4" || rel === "final-poster.jpg") {
+    const exportState = readRunExportState(id, run.status);
+    if (!exportState.finalReady) {
+      return NextResponse.json(
+        {
+          error: exportState.finalNeedsRepair
+            ? "Final video needs chunk repair before export."
+            : "Final video is not export-ready yet.",
+        },
+        { status: 409 }
+      );
+    }
   }
   if (rel === "final-poster.jpg") {
     const finalPath = path.join(runDir, "final.mp4");
@@ -143,4 +159,21 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       "Content-Length": String(size),
     },
   });
+}
+
+function normalizeRequestedPath(value: string): string | null {
+  try {
+    const decoded = decodeURIComponent(value);
+    if (path.isAbsolute(decoded)) return null;
+
+    const normalized = path.normalize(decoded).replaceAll("\\", "/");
+    const safeParts = normalized.split("/").filter((segment) => segment.length > 0);
+    if (safeParts.includes("..")) return null;
+    if (safeParts.length === 0) return "final.mp4";
+    return safeParts.join(path.sep);
+  } catch {
+    return null;
+  }
+
+  
 }

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { ensureInit } from "@/lib/init";
-import { resumeRun, canResumeRun } from "@/lib/pipeline";
+import { startResumeRun, canResumeRun } from "@/lib/pipeline";
 
 /**
  * Resume a failed / partial run.
@@ -27,11 +27,11 @@ export async function POST(_: Request, ctx: { params: Promise<{ id: string }> })
     );
   }
 
-  // Fire-and-forget — the run page streams logs over SSE.
-  resumeRun(id).catch((e) => {
-    // eslint-disable-next-line no-console
-    console.error("resume crash", e);
-  });
+  const worker = startResumeRun(id);
 
-  return NextResponse.json({ ok: true });
+  return NextResponse.json({
+    ok: true,
+    started: worker.started,
+    alreadyRunning: !worker.started && worker.active,
+  });
 }
