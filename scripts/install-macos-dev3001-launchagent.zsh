@@ -1,7 +1,7 @@
 #!/bin/zsh
 set -euo pipefail
 
-APP_DIR="/Users/hamidaliyev/Desktop/Conveyer-Hum"
+APP_DIR="/Users/hamidaliyev/Code/Conveyer-Hum"
 LABEL="com.conveyerhum.dev3001"
 PORT="3001"
 
