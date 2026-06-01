@@ -400,7 +400,11 @@ export default function StockGeneratePage() {
   const waitingCount = clips.filter((clip) => clip.status === "queued" || (clip.imageStatus === "done" && clip.videoStatus === "queued")).length;
   const completed = uploadedCount + failedCount;
   const percent = denominator > 0 ? Math.min(100, Math.round((completed / denominator) * 100)) : 0;
-  const elapsed = status?.startedAt ? formatElapsed((status.finishedAt || now) - status.startedAt) : "Loading...";
+  const elapsed = status?.startedAt
+    ? formatElapsed((status.finishedAt || now) - status.startedAt)
+    : status
+      ? "—" // loaded but never started (missing/not-yet-running) — avoid a stuck "Loading…"
+      : "Loading...";
   const refreshedCopy = lastRefreshedAt ? `${formatElapsed(now - lastRefreshedAt)} ago` : "Waiting...";
   const hasRecoveryState = !status || status.phase === "missing" || !!error && clips.length === 0;
 
@@ -516,9 +520,13 @@ export default function StockGeneratePage() {
       )}
 
       {clips.length === 0 ? (
-        <div className="card stock-gen-empty-card" style={{ color: "var(--fg-muted)", fontSize: 13 }}>
-          {emptyStateCopy(status)}
-        </div>
+        // The recovery card already explains missing/loading/error states — don't
+        // repeat the same message in a second card below it.
+        hasRecoveryState ? null : (
+          <div className="card stock-gen-empty-card" style={{ color: "var(--fg-muted)", fontSize: 13 }}>
+            {emptyStateCopy(status)}
+          </div>
+        )
       ) : (
         <div className="stock-gen-grid">
           {clips.map((clip) => (

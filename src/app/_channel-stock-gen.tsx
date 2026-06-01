@@ -117,7 +117,7 @@ export function ChannelStockGen({
     return (
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
         {clipCount != null && (
-          <span className="faint" style={{ fontSize: 11.5 }}>
+          <span className="muted" style={{ fontSize: 11.5 }}>
             {clipCount} B-roll clip{clipCount === 1 ? "" : "s"}
           </span>
         )}

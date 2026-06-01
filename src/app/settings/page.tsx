@@ -52,6 +52,33 @@ function isTabId(s: string | null): s is TabId {
   return !!s && TABS.some((t) => t.id === s);
 }
 
+/**
+ * Shown until the first settings/gdrive load resolves. Without it, the panel
+ * renders with empty values (every required field "missing"), which flashes a
+ * false "NEEDS SETUP / required / Connect Google Drive" state on every visit
+ * even when everything is configured.
+ */
+function SettingsPanelSkeleton() {
+  return (
+    <div role="status" aria-live="polite">
+      <span className="sr-only">Loading settings…</span>
+      <div aria-hidden="true">
+        {[0, 1].map((card) => (
+          <div key={card} className="card" style={{ marginBottom: 14 }}>
+            <div className="skeleton" style={{ height: 16, width: card === 0 ? 180 : 140, borderRadius: 6, marginBottom: 16 }} />
+            {[0, 1, 2].map((row) => (
+              <div key={row} style={{ marginBottom: 16 }}>
+                <div className="skeleton" style={{ height: 11, width: 120, borderRadius: 5, marginBottom: 8 }} />
+                <div className="skeleton" style={{ height: 38, width: "100%", borderRadius: 7 }} />
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function SettingsPage() {
   const [values, setValues] = useState<Record<string, string>>({});
   const [saved, setSaved] = useState(false);
@@ -62,17 +89,22 @@ export default function SettingsPage() {
   const [toast, setToast] = useState<string | null>(null);
   const [notice, setNotice] = useState<ActionNotice | null>(null);
   const [confirming, setConfirming] = useState<ConfirmRequest | null>(null);
+  const [loaded, setLoaded] = useState(false);
 
   async function load(reveal = false) {
-    const [settingsR, statsR, gdriveR] = await Promise.all([
-      fetch(`/api/settings${reveal ? "?reveal=1" : ""}`).then((r) => r.json()),
-      fetch("/api/stats").then((r) => r.json()).catch(() => null),
-      fetch("/api/gdrive/status").then((r) => r.json()).catch(() => null),
-    ]);
-    setValues(settingsR);
-    setStats(statsR);
-    setGdrive(gdriveR);
-    setRevealing(reveal);
+    try {
+      const [settingsR, statsR, gdriveR] = await Promise.all([
+        fetch(`/api/settings${reveal ? "?reveal=1" : ""}`).then((r) => r.json()).catch(() => null),
+        fetch("/api/stats").then((r) => r.json()).catch(() => null),
+        fetch("/api/gdrive/status").then((r) => r.json()).catch(() => null),
+      ]);
+      if (settingsR && typeof settingsR === "object") setValues(settingsR);
+      setStats(statsR);
+      setGdrive(gdriveR);
+      setRevealing(reveal);
+    } finally {
+      setLoaded(true);
+    }
   }
 
   useEffect(() => {
@@ -288,6 +320,10 @@ export default function SettingsPage() {
       </div>
 
       <section id={`settings-panel-${tab}`} role="tabpanel" aria-label={`${TABS.find((t) => t.id === tab)?.label ?? "Settings"} settings`}>
+        {!loaded ? (
+          <SettingsPanelSkeleton />
+        ) : (
+          <>
         {/* Keys tab: parallel-capacity readout above the key fields. */}
         {tab === "keys" && stats && stats.keyCount > 0 && (
           <div className="card" style={{ marginBottom: 16 }}>
@@ -328,6 +364,8 @@ export default function SettingsPage() {
             onConnect={connectGdrive}
             onDisconnect={disconnectGdrive}
           />
+        )}
+          </>
         )}
       </section>
     </div>
